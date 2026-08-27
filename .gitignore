@@ -29,3 +29,7 @@ test/*.xml
 contacts.csv
 test/contacts.csv
 test/*.db
+
+# Spam list (archive-side, portable, user-managed)
+spamnumbers.txt
+test/spamnumbers.txt

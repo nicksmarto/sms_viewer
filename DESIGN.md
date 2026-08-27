@@ -48,6 +48,13 @@ everything as a familiar, searchable messaging UI — entirely offline.
   into a possibly cloud-synced location.
 - **Contact-name resolution.** Numbers are resolved to names using data in the backups plus
   an optional `contacts.csv`; those names also drive the media folder names.
+- **Whitelist + spam blacklist.** `contacts.csv` doubles as a whitelist; a portable
+  `spamnumbers.txt` (kept in the archive folder, so it travels with the backups) is a
+  blacklist. Spam is filtered at *query time* — marking a number hides it instantly with no
+  rebuild, and un-marking restores it — while **contacts always override spam** so a known
+  person can never be hidden by accident. On rebuild, spam senders' media is segregated into
+  a flat `Spam/` folder (number-prefixed filenames). All matching uses the same number
+  normalization (country code stripped, punctuation ignored).
 - **Cache lifecycle.** On opening an archive the cache is validated — it must exist, pass an
   integrity check, match the current cache format version, and match a manifest of the
   source files — and is reused when healthy, rebuilt when not.

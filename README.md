@@ -22,6 +22,7 @@ ever uploaded. It's a Flask app you run locally that opens in your web browser.
 - **Full-text search** — search across every message, and filter conversations by contact name.
 - **Contact-name resolution** — turns phone numbers into names using the backup data plus an optional `contacts.csv`.
 - **Group-chat support** — correctly identifies group conversations and their participants.
+- **Spam filtering** — hide junk numbers with one click; the list is a portable `spamnumbers.txt`, and contacts are always shown.
 - **Media deduplication** — skips duplicate images (common across overlapping backups) by content hash, and sets each extracted file's date to when the message was received.
 - **Robust parsing** — skips corrupted/malformed entries instead of failing the whole file.
 
@@ -100,8 +101,36 @@ python app.py
    choose the **XML** format (this is the app's default).
 2. Transfer the resulting `.xml` file(s) to a folder on your computer. You can put several
    backups in the same folder — the viewer merges and de-duplicates them.
-3. *(Optional)* Export your contacts (e.g. from Google Contacts) as **`contacts.csv`** and
-   place it in that same folder for nicer name resolution.
+3. *(Optional)* Export your contacts as **`contacts.csv`** and place it in that same folder
+   (see below).
+
+---
+
+## Contacts & spam filtering
+
+Two optional files in your archive folder shape what you see. Both are **portable** — they
+travel with your backups if you move the folder.
+
+**`contacts.csv` — names + whitelist.** Turns phone numbers into names. Export it from
+Google Contacts: at [contacts.google.com](https://contacts.google.com), select the contacts
+you want (or all), then **Export → Google CSV**, and drop the file next to your `.xml`
+backups. Re-open the archive (or rebuild) to pick it up. Contacts also act as a
+**whitelist**: a number in your contacts is *never* hidden by the spam filter.
+
+**`spamnumbers.txt` — blacklist.** A list of numbers to hide (one per line). You don't edit
+it by hand:
+
+- In any conversation, click **🚫 Mark as spam** — the number is added and the conversation
+  disappears **immediately**, no rebuild needed.
+- Use **🚫 Manage spam numbers** in the sidebar to see the list and **Remove** any you added
+  by mistake (it reappears instantly).
+- **Contacts always win:** a spam number that's also in `contacts.csv` is shown anyway (and
+  flagged in the panel), so you can't accidentally hide a real person.
+- On a **rebuild**, spam senders' media is still extracted but moved into a single flat
+  `Spam/` folder (filenames prefixed with the number) instead of per-sender folders.
+
+Number formatting is normalized automatically, so `+1 (724) 555-1234`, `1724…`, and `724…`
+all match the same number.
 
 ---
 
