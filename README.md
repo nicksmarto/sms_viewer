@@ -33,23 +33,42 @@ ever uploaded. It's a Flask app you run locally that opens in your web browser.
 - A modern web browser
 - One or more `.xml` backup files exported by **SMS Backup & Restore**
 
+The GitHub repository *is* the application — to use it, you download the code and run it
+locally on your own computer against your own backups. First, **get the code**: either
+`git clone https://github.com/nicksmarto/sms_viewer.git`, or use the green
+**Code → Download ZIP** button on GitHub and unzip it.
+
 ---
 
-## Installation
+## Quick start (the easy way — no terminal)
 
-The GitHub repository *is* the application — to use it, you download the code and run it
-locally on your own computer against your own backups.
+Once you have the folder, just:
 
-**1. Get the code**
+- **macOS:** double-click **`run.command`**
+- **Windows:** double-click **`run.bat`**
 
-```bash
-git clone https://github.com/nicksmarto/sms_viewer.git
-cd sms_viewer
-```
+The **first** launch sets everything up automatically (it creates an isolated Python
+environment and installs the dependencies — this takes a minute). **Every** launch after
+that starts the app instantly and opens your browser at **http://127.0.0.1:5000**. Keep
+the small terminal window that appears open while you use the app; closing it stops the app.
 
-(Or use the green **Code → Download ZIP** button on GitHub and unzip it.)
+> **macOS note:** if double-clicking shows a security warning (because the file was
+> downloaded), right-click `run.command` → **Open** → **Open** — just the first time. If
+> your Mac opens the file in a text editor instead of running it, right-click →
+> **Open With → Terminal**.
 
-**2. Create a virtual environment and install dependencies**
+You still need **Python 3** installed (see Requirements above); everything else is
+automatic. Prefer to run things yourself, or curious what the launcher does under the
+hood? See **Manual setup** below.
+
+---
+
+## Manual setup (optional)
+
+The launcher above does all of this for you. Follow these steps only if you'd rather set
+things up by hand or want to understand what's happening.
+
+**1. Create a virtual environment and install dependencies**
 
 ```bash
 python3 -m venv venv
@@ -57,7 +76,7 @@ source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-**3. (Optional) Set your own phone number**
+**2. (Optional) Set your own phone number**
 
 This lets the app recognize *you* in group conversations. Copy the example env file and
 fill it in — your `.env` stays local and is never committed:
@@ -65,6 +84,12 @@ fill it in — your `.env` stays local and is never committed:
 ```bash
 cp .env.example .env
 # then edit .env and set MY_PHONE_NUMBER=your10digitnumber
+```
+
+**3. Start the app**
+
+```bash
+python app.py
 ```
 
 ---
@@ -84,9 +109,8 @@ cp .env.example .env
 
 **1. Start the app**
 
-```bash
-python3 app.py
-```
+Double-click **`run.command`** (macOS) or **`run.bat`** (Windows) — or, if you did the
+manual setup, run `python app.py` from your activated environment.
 
 Your browser opens automatically at **http://127.0.0.1:5000** (if not, open that URL).
 
