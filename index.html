@@ -30,6 +30,9 @@
                 </div>
                 <button id="submit-dir-path" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors">Set Directory &amp; Load</button>
                 <div id="modal-error" class="text-red-400 mt-4 text-sm hidden"></div>
+                <div class="mt-4 text-center">
+                    <button id="welcome-manage-caches" class="text-xs text-gray-400 hover:text-blue-400 underline">Manage cached indexes</button>
+                </div>
             </div>
         </div>
 
@@ -56,6 +59,7 @@
                 </div>
                 <footer class="p-2 border-t border-gray-700 flex-shrink-0 space-y-2">
                     <button id="export-media-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">⬇︎ Export media to folder…</button>
+                    <button id="manage-caches-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">🗄 Manage cached indexes…</button>
                     <button id="rebuild-index-btn" class="w-full text-center text-xs bg-red-800 hover:bg-red-700 text-white font-semibold py-1 px-2 rounded transition-colors">Rebuild Index</button>
                 </footer>
             </aside>
@@ -76,6 +80,24 @@
                     </div>
                 </div>
             </main>
+        </div>
+
+        <!-- Cache management modal -->
+        <div id="cache-modal" class="fixed inset-0 bg-gray-900 bg-opacity-80 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-800 p-6 rounded-lg shadow-2xl max-w-2xl w-full flex flex-col" style="max-height: 80vh;">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-xl font-bold text-white">Cached indexes</h2>
+                    <button id="close-cache-modal" class="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
+                </div>
+                <p class="text-sm text-gray-400 mb-4">Every archive you open is indexed into a local cache under
+                    <code class="bg-gray-700 px-1 rounded text-emerald-400 text-xs" id="cache-root-path"></code>.
+                    Rebuilding an archive replaces its cache; opening a new folder adds one. Your original backups are never touched.</p>
+                <div id="cache-list" class="overflow-y-auto flex-grow space-y-2 mb-4 min-h-[4rem]"></div>
+                <div class="flex items-center justify-between border-t border-gray-700 pt-3">
+                    <div class="text-sm text-gray-300">Total: <strong id="cache-total" class="text-white">—</strong></div>
+                    <button id="prune-caches-btn" class="text-xs bg-yellow-700 hover:bg-yellow-600 text-white font-semibold py-1.5 px-3 rounded transition-colors">Clear unused caches</button>
+                </div>
+            </div>
         </div>
 
         <!-- Indexing overlay -->
@@ -120,6 +142,14 @@
                     indexingProgressText: document.getElementById('indexing-progress-text'),
                     indexingFileText: document.getElementById('indexing-file-text'),
                     indexingCountsText: document.getElementById('indexing-counts-text'),
+                    cacheModal: document.getElementById('cache-modal'),
+                    closeCacheModal: document.getElementById('close-cache-modal'),
+                    cacheList: document.getElementById('cache-list'),
+                    cacheRootPath: document.getElementById('cache-root-path'),
+                    cacheTotal: document.getElementById('cache-total'),
+                    pruneCachesBtn: document.getElementById('prune-caches-btn'),
+                    welcomeManageCaches: document.getElementById('welcome-manage-caches'),
+                    manageCachesBtn: document.getElementById('manage-caches-btn'),
                 },
                 state: {
                     searchTimeout: null,
@@ -164,6 +194,12 @@
                 },
                 showIndexingOverlay: (show) => {
                     G.els.indexingOverlay.style.display = show ? 'flex' : 'none';
+                },
+                formatBytes: (n) => {
+                    if (!n) return '0 B';
+                    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.floor(Math.log(n) / Math.log(1024));
+                    return `${(n / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`;
                 }
             };
             
@@ -393,6 +429,67 @@
                         btn.textContent = original;
                     }
                 },
+                openCacheManager: async () => {
+                    G.els.cacheModal.classList.remove('hidden');
+                    G.els.cacheList.innerHTML = `<p class="text-sm text-gray-500 p-2">Loading…</p>`;
+                    try {
+                        const data = await api.get('/api/caches');
+                        actions.renderCaches(data);
+                    } catch (e) {
+                        G.els.cacheList.innerHTML = `<p class="text-sm text-red-400 p-2">Could not load caches: ${e.message}</p>`;
+                    }
+                },
+                renderCaches: (data) => {
+                    G.els.cacheRootPath.textContent = data.cache_root;
+                    G.els.cacheTotal.textContent = utils.formatBytes(data.total_size_bytes);
+                    if (!data.caches || data.caches.length === 0) {
+                        G.els.cacheList.innerHTML = `<p class="text-sm text-gray-500 p-2">No cached indexes yet.</p>`;
+                        return;
+                    }
+                    G.els.cacheList.innerHTML = '';
+                    data.caches.forEach(cache => {
+                        const name = cache.source_dir ? cache.source_dir.split('/').filter(Boolean).pop() : cache.hash;
+                        const badges = [];
+                        if (cache.is_current) badges.push(`<span class="text-xs bg-blue-700 text-white px-1.5 py-0.5 rounded">in use now</span>`);
+                        if (!cache.source_exists) badges.push(`<span class="text-xs bg-yellow-700 text-white px-1.5 py-0.5 rounded">source folder missing</span>`);
+                        const msgs = cache.message_count ? `${Number(cache.message_count).toLocaleString()} messages` : '';
+                        const when = cache.indexed_at ? `indexed ${cache.indexed_at.replace('T', ' ')}` : '';
+                        const meta = [utils.formatBytes(cache.size_bytes), msgs, when].filter(Boolean).join(' · ');
+
+                        const item = document.createElement('div');
+                        item.className = 'bg-gray-900 rounded-md p-3 flex items-center justify-between gap-3';
+                        item.innerHTML = `
+                            <div class="min-w-0">
+                                <div class="text-sm text-white truncate flex items-center gap-2">${utils.escapeHtml(name)} ${badges.join(' ')}</div>
+                                <div class="text-xs text-gray-500 truncate" title="${utils.escapeHtml(cache.source_dir)}">${utils.escapeHtml(cache.source_dir || '(unknown source)')}</div>
+                                <div class="text-xs text-gray-400 mt-1">${meta}</div>
+                            </div>
+                            <button class="cache-delete-btn flex-shrink-0 text-xs bg-red-800 hover:bg-red-700 text-white font-semibold py-1.5 px-3 rounded" data-hash="${cache.hash}" data-label="${utils.escapeHtml(name)}">Delete</button>
+                        `;
+                        item.querySelector('.cache-delete-btn').addEventListener('click', () => actions.deleteCache(cache.hash, name, cache.is_current));
+                        G.els.cacheList.appendChild(item);
+                    });
+                },
+                deleteCache: async (hash, label, isCurrent) => {
+                    const warn = isCurrent ? '\n\nThis is the cache you are viewing right now — the app will need to re-index it next time you open it.' : '';
+                    if (!confirm(`Delete the cached index for "${label}"? Your original backup files are not affected.${warn}`)) return;
+                    try {
+                        const r = await api.post('/api/caches/delete', { hash });
+                        actions.renderCaches(await api.get('/api/caches'));
+                    } catch (e) {
+                        alert(`Could not delete cache: ${e.message}`);
+                    }
+                },
+                pruneCaches: async () => {
+                    if (!confirm('Delete all caches whose source folder no longer exists? Your original backups are not affected.')) return;
+                    try {
+                        const r = await api.post('/api/caches/prune', {});
+                        actions.renderCaches(await api.get('/api/caches'));
+                        alert(r.removed.length ? `Cleared ${r.removed.length} unused cache(s), freed ${utils.formatBytes(r.freed_bytes)}.` : 'No unused caches to clear.');
+                    } catch (e) {
+                        alert(`Could not clear caches: ${e.message}`);
+                    }
+                },
                 handleSearch: async () => {
                     const query = G.els.searchInput.value.trim();
 
@@ -492,13 +589,24 @@
                 G.state.searchTimeout = setTimeout(actions.handleSearch, 300);
             });
 
+            G.els.welcomeManageCaches.addEventListener('click', actions.openCacheManager);
+            G.els.manageCachesBtn.addEventListener('click', actions.openCacheManager);
+            G.els.pruneCachesBtn.addEventListener('click', actions.pruneCaches);
+            G.els.closeCacheModal.addEventListener('click', () => G.els.cacheModal.classList.add('hidden'));
+            G.els.cacheModal.addEventListener('click', (e) => {
+                if (e.target === G.els.cacheModal) G.els.cacheModal.classList.add('hidden');
+            });
+
             G.els.closeImageModal.addEventListener('click', utils.hideImageModal);
             G.els.imageModal.addEventListener('click', (e) => {
                 if (e.target === G.els.imageModal) utils.hideImageModal();
             });
 
             document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') utils.hideImageModal();
+                if (e.key === 'Escape') {
+                    utils.hideImageModal();
+                    G.els.cacheModal.classList.add('hidden');
+                }
             });
         });
     </script>
