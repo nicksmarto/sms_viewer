@@ -14,9 +14,15 @@ import time
 from io import StringIO
 import logging
 from datetime import datetime
+from dotenv import load_dotenv
 
 # --- Configuration ---
+load_dotenv()  # Load variables from a local .env file (gitignored) if present.
 DB_NAME = 'sms_messages.db'
+
+# Your own phone number (digits only), used to identify "you" in group
+# conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
+MY_PHONE_NUMBER = os.environ.get('MY_PHONE_NUMBER', '')
 
 # --- Flask App Initialization ---
 app = Flask(__name__, template_folder='.')
@@ -356,8 +362,8 @@ def process_xml_files():
                             if address_val and not re.search('[a-zA-Z]', address_val):
                                 participant_addrs.add(normalize_number(address_val))
                         
-                        my_number = '' # This should be configurable
-                        participant_addrs.discard(my_number)
+                        if MY_PHONE_NUMBER:
+                            participant_addrs.discard(MY_PHONE_NUMBER)
                         participants = '~'.join(sorted(list(filter(None, participant_addrs)))) or normalized_address
 
                         from_address_node = elem.find(".//addr[@type='137']")
