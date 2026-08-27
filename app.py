@@ -13,6 +13,8 @@ import webbrowser
 import time
 from io import StringIO
 import logging
+import sys
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -20,9 +22,53 @@ from dotenv import load_dotenv
 load_dotenv()  # Load variables from a local .env file (gitignored) if present.
 DB_NAME = 'sms_messages.db'
 
+# Bump this whenever the cache layout or DB schema changes in a way that makes
+# an old cache unusable. assess_cache() rebuilds automatically on a mismatch.
+CACHE_FORMAT_VERSION = 2
+
 # Your own phone number (digits only), used to identify "you" in group
 # conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
 MY_PHONE_NUMBER = os.environ.get('MY_PHONE_NUMBER', '')
+
+
+# --- Local cache location -------------------------------------------------
+# Generated data (the SQLite index and extracted media) is kept in a LOCAL
+# app-data folder, never inside the archive folder the user points at. This
+# avoids SQLite "disk I/O error" failures on cloud-synced folders (e.g. Google
+# Drive) and keeps the user's backup folder pristine. Each archive gets its own
+# cache keyed by the absolute path it was indexed from.
+def get_cache_root():
+    """Return the base folder for all caches, per-OS conventions."""
+    if sys.platform == 'darwin':
+        base = os.path.expanduser('~/Library/Application Support/SMSViewer')
+    elif os.name == 'nt':
+        base = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'SMSViewer')
+    else:
+        base = os.path.join(os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')), 'SMSViewer')
+    return base
+
+
+def get_cache_dir_for(source_dir):
+    """A stable, per-archive cache directory derived from the source path."""
+    key = hashlib.sha256(os.path.abspath(source_dir).encode('utf-8')).hexdigest()[:16]
+    return os.path.join(get_cache_root(), key)
+
+
+def build_source_manifest(source_dir):
+    """A fingerprint of the archive's XML files (name -> size + mtime).
+    If this changes, the cache is stale and should be rebuilt."""
+    manifest = {}
+    try:
+        for f in sorted(os.listdir(source_dir)):
+            if f.lower().endswith('.xml'):
+                try:
+                    st = os.stat(os.path.join(source_dir, f))
+                    manifest[f] = {'size': st.st_size, 'mtime': int(st.st_mtime)}
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return manifest
 
 # --- Flask App Initialization ---
 app = Flask(__name__, template_folder='.')
@@ -37,8 +83,14 @@ def get_db_connection():
         app.logger.error("DB_PATH not configured.")
         return None
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        # Robustness: WAL improves concurrent read/write and resilience; a busy
+        # timeout prevents transient "database is locked" errors from failing.
+        if db_path != ":memory:":
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA busy_timeout=30000')
         return conn
     except sqlite3.Error as e:
         app.logger.error(f"Database connection error: {e}")
@@ -89,6 +141,11 @@ def init_db():
                     address TEXT PRIMARY KEY, name TEXT NOT NULL
                 );
             ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS cache_meta (
+                    key TEXT PRIMARY KEY, value TEXT
+                );
+            ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_participants ON messages (participants);')
         
         app.logger.info("Database initialization complete.")
@@ -102,10 +159,57 @@ def init_db():
 
 indexing_status = {
     'running': False,
-    'progress': 0,
-    'total': 0,
-    'current_file': ''
+    'progress': 0,          # files processed so far
+    'total': 0,             # total files to process
+    'current_file': '',
+    'phase': 'idle',        # idle | starting | parsing | finalizing | done | error
+    'messages_indexed': 0,
+    'media_extracted': 0,
+    'date_range': '',       # date span of the file currently being processed
+    'error': None,
 }
+
+
+def assess_cache(source_dir):
+    """Inspect the cache for `source_dir` and decide whether it can be reused.
+
+    Returns a dict with a `status`:
+      absent   - no cache yet (first run) -> build
+      ready    - healthy and matches the current backups -> use as-is
+      stale    - backups changed since indexing -> rebuild recommended
+      outdated - built by an older cache format -> rebuild
+      corrupt  - failed the integrity check -> rebuild
+    """
+    cache_dir = get_cache_dir_for(source_dir)
+    db_path = os.path.join(cache_dir, DB_NAME)
+    if not os.path.exists(db_path):
+        return {'status': 'absent'}
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        integrity = conn.execute('PRAGMA quick_check').fetchone()[0]
+        if integrity != 'ok':
+            return {'status': 'corrupt', 'reason': 'failed integrity check'}
+        has_meta = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cache_meta'"
+        ).fetchone()
+        if not has_meta:
+            return {'status': 'outdated', 'reason': 'built by an older version (no metadata)'}
+        meta = {r['key']: r['value'] for r in conn.execute('SELECT key, value FROM cache_meta')}
+        if str(meta.get('format_version')) != str(CACHE_FORMAT_VERSION):
+            return {'status': 'outdated', 'reason': 'cache format changed'}
+        stored = json.loads(meta.get('source_manifest') or '{}')
+        if stored != build_source_manifest(source_dir):
+            return {'status': 'stale', 'reason': 'backup files changed since last index',
+                    'message_count': meta.get('message_count'), 'indexed_at': meta.get('indexed_at')}
+        return {'status': 'ready', 'message_count': meta.get('message_count'),
+                'indexed_at': meta.get('indexed_at')}
+    except (sqlite3.Error, ValueError) as e:
+        return {'status': 'corrupt', 'reason': str(e)}
+    finally:
+        if conn:
+            conn.close()
 
 def normalize_number(phone_number):
     if not phone_number: return None
@@ -288,15 +392,18 @@ def load_contacts_from_csv(directory):
 
 def process_xml_files():
     global indexing_status
-    indexing_status.update({'running': True, 'progress': 0, 'current_file': ''})
-    
+    indexing_status.update({
+        'running': True, 'progress': 0, 'current_file': '', 'phase': 'starting',
+        'messages_indexed': 0, 'media_extracted': 0, 'date_range': '', 'error': None,
+    })
+
     xml_directory = app.config.get("XML_DIRECTORY")
-    media_dir = os.path.join(xml_directory, 'mms_media')
+    media_dir = app.config.get("MEDIA_DIR")
     os.makedirs(media_dir, exist_ok=True)
 
     xml_files = [f for f in os.listdir(xml_directory) if f.lower().endswith('.xml')]
     indexing_status['total'] = len(xml_files)
-    
+
     conn = get_db_connection()
     all_contact_names = load_contacts_from_csv(xml_directory)
     total_mms_count, total_media_files_found = 0, 0
@@ -310,7 +417,7 @@ def process_xml_files():
             )
     
     for i, filename in enumerate(xml_files):
-        indexing_status.update({'current_file': f"Processing: {filename}", 'progress': i + 1})
+        indexing_status.update({'current_file': filename, 'progress': i + 1, 'phase': 'parsing'})
         filepath = os.path.join(xml_directory, filename)
         
         messages_to_insert = []
@@ -450,27 +557,100 @@ def process_xml_files():
                     INSERT OR IGNORE INTO messages (address, date, type, body, mms_media_path, mms_media_type, sender_address, readable_date, unique_hash, participants)
                     VALUES (:address, :date, :type, :body, :mms_media_path, :mms_media_type, :sender_address, :readable_date, :unique_hash, :participants)
                 ''', messages_to_insert)
-        
+            indexing_status['messages_indexed'] += len(messages_to_insert)
+
         min_date_str = datetime.fromtimestamp(min_date / 1000.0).strftime('%Y-%m-%d') if min_date else "N/A"
         max_date_str = datetime.fromtimestamp(max_date / 1000.0).strftime('%Y-%m-%d') if max_date else "N/A"
+        indexing_status.update({
+            'media_extracted': total_media_files_found,
+            'date_range': f"{min_date_str} to {max_date_str}",
+        })
         app.logger.info(f"  File '{filename}' ({i+1}/{len(xml_files)}) complete. Contains: {min_date_str} to {max_date_str}.")
 
+    indexing_status['phase'] = 'finalizing'
     app.logger.info(f"\nProcessed {total_mms_count} MMS messages, found {total_media_files_found} media files")
-    
+
     with conn:
         total_messages = conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
         total_mms_media = conn.execute('SELECT COUNT(*) FROM messages WHERE mms_media_path IS NOT NULL').fetchone()[0]
+        # Record cache metadata so this cache can be validated/reused next time.
+        meta = {
+            'format_version': str(CACHE_FORMAT_VERSION),
+            'source_dir': xml_directory,
+            'source_manifest': json.dumps(build_source_manifest(xml_directory)),
+            'indexed_at': datetime.now().isoformat(timespec='seconds'),
+            'message_count': str(total_messages),
+        }
+        conn.executemany('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)', list(meta.items()))
         app.logger.info(f"\n=== INDEXING COMPLETE ===")
         app.logger.info(f"Total messages in DB: {total_messages}")
         app.logger.info(f"MMS media files in DB: {total_mms_media}")
 
     conn.close()
-    indexing_status['running'] = False
+    indexing_status.update({
+        'messages_indexed': total_messages, 'media_extracted': total_media_files_found,
+        'phase': 'done', 'current_file': '',
+    })
+
+def run_indexing():
+    """Wrapper around process_xml_files that never leaves the status stuck
+    'running' if something unexpected fails."""
+    global indexing_status
+    try:
+        process_xml_files()
+    except Exception as e:
+        app.logger.error(f"Indexing failed: {e}", exc_info=True)
+        indexing_status.update({'phase': 'error', 'error': str(e)})
+    finally:
+        indexing_status['running'] = False
+
 
 # --- Flask API Endpoints ---
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/api/browse-folder', methods=['POST'])
+def browse_folder():
+    """Open a NATIVE folder chooser on the machine running the server (this is a
+    local app, so that's the user's own computer) and return the chosen path.
+    Returns {'path': ''} if the user cancels."""
+    start = (request.json or {}).get('start') or os.path.expanduser('~')
+    if not os.path.isdir(start):
+        start = os.path.expanduser('~')
+    try:
+        if sys.platform == 'darwin':
+            # AppleScript: reliable, no extra dependencies. `default location`
+            # seeds the dialog at the current path if there is one.
+            script = (
+                'set startFolder to POSIX file "%s" as alias\n'
+                'POSIX path of (choose folder with prompt '
+                '"Select your SMS backup folder" default location startFolder)'
+                % start.replace('"', '\\"')
+            )
+            r = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+            # Non-zero return code is normal when the user clicks Cancel.
+            path = r.stdout.strip() if r.returncode == 0 else ''
+        elif os.name == 'nt':
+            ps = (
+                'Add-Type -AssemblyName System.Windows.Forms;'
+                '$d = New-Object System.Windows.Forms.FolderBrowserDialog;'
+                'if ($d.ShowDialog() -eq "OK") { Write-Output $d.SelectedPath }'
+            )
+            r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                               capture_output=True, text=True)
+            path = r.stdout.strip() if r.returncode == 0 else ''
+        else:
+            # Linux/other: fall back to a Tk dialog if available.
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+            path = filedialog.askdirectory(initialdir=start) or ''
+            root.destroy()
+        return jsonify({'path': path.rstrip('/') if path else ''})
+    except Exception as e:
+        app.logger.error(f"Folder picker failed: {e}")
+        return jsonify({'error': 'The folder picker is unavailable; paste a path instead.'}), 500
 
 @app.route('/api/set-directory', methods=['POST'])
 def set_directory():
@@ -485,20 +665,30 @@ def set_directory():
         app.logger.warning(f"Directory does not exist: {path}")
         return jsonify({'error': f"Directory not found: {path}"}), 400
 
+    # Generated data lives in a LOCAL cache, never inside the (possibly
+    # cloud-synced) archive folder. This is what fixes the "disk I/O error".
+    cache_dir = get_cache_dir_for(path)
+    os.makedirs(cache_dir, exist_ok=True)
     app.config['XML_DIRECTORY'] = path
-    app.config['DB_PATH'] = os.path.join(path, DB_NAME)
-    app.logger.info(f"XML_DIRECTORY set to: {app.config['XML_DIRECTORY']}")
-    app.logger.info(f"DB_PATH set to: {app.config['DB_PATH']}")
+    app.config['DB_PATH'] = os.path.join(cache_dir, DB_NAME)
+    app.config['MEDIA_DIR'] = os.path.join(cache_dir, 'media')
+    os.makedirs(app.config['MEDIA_DIR'], exist_ok=True)
+    app.logger.info(f"XML_DIRECTORY set to: {path}")
+    app.logger.info(f"Cache directory: {cache_dir}")
 
     try:
-        db_exists_before_init = os.path.exists(app.config['DB_PATH'])
-        app.logger.info(f"Database exists before init: {db_exists_before_init}")
-        
-        if not init_db():
-            app.logger.error("Failed to initialize database.")
-            return jsonify({'error': 'Failed to initialize database. Check server logs for details.'}), 500
-        
-        return jsonify({'db_exists': db_exists_before_init})
+        # Assess the existing cache BEFORE init_db creates an empty database.
+        assessment = assess_cache(path)
+        app.logger.info(f"Cache status: {assessment}")
+
+        # Ensure a schema-current DB exists, unless the existing one is corrupt
+        # (in which case a rebuild will delete and recreate it).
+        if assessment['status'] != 'corrupt':
+            if not init_db():
+                app.logger.error("Failed to initialize database.")
+                return jsonify({'error': 'Failed to initialize database. Check server logs for details.'}), 500
+
+        return jsonify({'cache': assessment, 'cache_dir': cache_dir})
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in set_directory: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected server error occurred.'}), 500
@@ -507,18 +697,23 @@ def set_directory():
 def start_indexing():
     if indexing_status['running']: return jsonify({'message': 'Indexing is already in progress.'}), 409
     if request.json.get('rebuild', False):
-        xml_directory = app.config.get("XML_DIRECTORY")
         db_path = app.config.get("DB_PATH")
-        media_dir = os.path.join(xml_directory, 'mms_media')
+        media_dir = app.config.get("MEDIA_DIR")
 
-        if db_path and os.path.exists(db_path):
-            os.remove(db_path)
-        
-        if os.path.exists(media_dir):
+        # Remove the DB and its WAL sidecar files, plus all extracted media.
+        if db_path:
+            for suffix in ('', '-wal', '-shm'):
+                p = db_path + suffix
+                if os.path.exists(p):
+                    os.remove(p)
+
+        if media_dir and os.path.exists(media_dir):
             shutil.rmtree(media_dir)
+        if media_dir:
+            os.makedirs(media_dir, exist_ok=True)
 
         init_db()
-    Thread(target=process_xml_files).start()
+    Thread(target=run_indexing).start()
     return jsonify({'message': 'Indexing started.'})
 
 @app.route('/api/indexing-status')
@@ -545,8 +740,37 @@ def get_stats():
 
 @app.route('/api/media/<path:filename>')
 def get_media(filename):
-    media_dir = os.path.join(app.config.get("XML_DIRECTORY"), 'mms_media')
+    media_dir = app.config.get("MEDIA_DIR")
     return send_from_directory(media_dir, filename)
+
+@app.route('/api/export-media', methods=['POST'])
+def export_media():
+    """Copy the sender-organized media out of the local cache into a browsable
+    `mms_media/` folder (defaults to the archive folder). On-demand only."""
+    media_dir = app.config.get("MEDIA_DIR")
+    xml_dir = app.config.get("XML_DIRECTORY")
+    if not media_dir or not os.path.isdir(media_dir) or not os.listdir(media_dir):
+        return jsonify({'error': 'No extracted media to export yet. Index an archive first.'}), 400
+
+    dest_root = (request.json or {}).get('destination') or xml_dir
+    if not dest_root or not os.path.isdir(dest_root):
+        return jsonify({'error': 'Export destination folder not found.'}), 400
+    dest = os.path.join(dest_root, 'mms_media')
+
+    try:
+        count = 0
+        for root, _dirs, files in os.walk(media_dir):
+            rel = os.path.relpath(root, media_dir)
+            target_dir = dest if rel == '.' else os.path.join(dest, rel)
+            os.makedirs(target_dir, exist_ok=True)
+            for fn in files:
+                shutil.copy2(os.path.join(root, fn), os.path.join(target_dir, fn))
+                count += 1
+        app.logger.info(f"Exported {count} media files to {dest}")
+        return jsonify({'exported': count, 'destination': dest})
+    except OSError as e:
+        app.logger.error(f"Media export failed: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/conversations')
 def get_conversations():

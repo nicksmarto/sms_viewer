@@ -23,9 +23,12 @@
         <div id="modal-container" class="fixed inset-0 bg-gray-900 bg-opacity-80 flex items-center justify-center z-50">
             <div class="bg-gray-800 p-8 rounded-lg shadow-2xl max-w-lg w-full">
                 <h2 class="text-2xl font-bold mb-4 text-white">Welcome to SMS Backup Viewer</h2>
-                <p class="mb-6 text-gray-400">Please provide the absolute path to the directory containing your <code class="bg-gray-700 text-emerald-400 px-1 rounded">.xml</code> backup files.</p>
-                <input type="text" id="dir-path-input" placeholder="e.g., /Users/yourname/Documents/SMSBackups" class="w-full bg-gray-900 border border-gray-700 text-white rounded-md px-4 py-2 mb-4 focus:ring-2 focus:ring-blue-500 focus:outline-none">
-                <button id="submit-dir-path" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors">Set Directory & Load</button>
+                <p class="mb-6 text-gray-400">Choose the folder that contains your <code class="bg-gray-700 text-emerald-400 px-1 rounded">.xml</code> backup files — click <strong>Browse…</strong>, or paste the path.</p>
+                <div class="flex gap-2 mb-4">
+                    <input type="text" id="dir-path-input" placeholder="Pick a folder, or paste a path…" class="flex-grow min-w-0 bg-gray-900 border border-gray-700 text-white rounded-md px-4 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    <button id="browse-folder-btn" class="flex-shrink-0 bg-gray-700 hover:bg-gray-600 text-white font-semibold px-4 rounded-md transition-colors">Browse…</button>
+                </div>
+                <button id="submit-dir-path" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors">Set Directory &amp; Load</button>
                 <div id="modal-error" class="text-red-400 mt-4 text-sm hidden"></div>
             </div>
         </div>
@@ -51,7 +54,8 @@
                 <div id="stats-panel" class="p-4 text-xs text-gray-400 border-b border-gray-700 flex-shrink-0 space-y-1"></div>
                 <div id="conversation-list" class="overflow-y-auto flex-grow">
                 </div>
-                <footer class="p-2 border-t border-gray-700 flex-shrink-0">
+                <footer class="p-2 border-t border-gray-700 flex-shrink-0 space-y-2">
+                    <button id="export-media-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">⬇︎ Export media to folder…</button>
                     <button id="rebuild-index-btn" class="w-full text-center text-xs bg-red-800 hover:bg-red-700 text-white font-semibold py-1 px-2 rounded transition-colors">Rebuild Index</button>
                 </footer>
             </aside>
@@ -84,6 +88,7 @@
                 </div>
                 <p id="indexing-progress-text" class="mt-2 text-sm text-gray-400">Initializing...</p>
                 <p id="indexing-file-text" class="mt-1 text-xs text-gray-500 truncate w-64 mx-auto"></p>
+                <p id="indexing-counts-text" class="mt-1 text-xs text-blue-300"></p>
             </div>
         </div>
     </div>
@@ -96,6 +101,7 @@
                     mainUI: document.getElementById('main-ui'),
                     dirPathInput: document.getElementById('dir-path-input'),
                     submitDirPathBtn: document.getElementById('submit-dir-path'),
+                    browseFolderBtn: document.getElementById('browse-folder-btn'),
                     modalError: document.getElementById('modal-error'),
                     conversationList: document.getElementById('conversation-list'),
                     messageList: document.getElementById('message-list'),
@@ -104,6 +110,7 @@
                     currentNumber: document.getElementById('current-number'),
                     statsPanel: document.getElementById('stats-panel'),
                     rebuildIndexBtn: document.getElementById('rebuild-index-btn'),
+                    exportMediaBtn: document.getElementById('export-media-btn'),
                     searchInput: document.getElementById('search-input'),
                     imageModal: document.getElementById('image-modal'),
                     modalImage: document.getElementById('modal-image'),
@@ -112,6 +119,7 @@
                     indexingProgressBar: document.getElementById('indexing-progress-bar'),
                     indexingProgressText: document.getElementById('indexing-progress-text'),
                     indexingFileText: document.getElementById('indexing-file-text'),
+                    indexingCountsText: document.getElementById('indexing-counts-text'),
                 },
                 state: {
                     searchTimeout: null,
@@ -331,8 +339,11 @@
                             } else {
                                 const percent = status.total > 0 ? Math.round((status.progress / status.total) * 100) : 0;
                                 G.els.indexingProgressBar.style.width = `${percent}%`;
-                                G.els.indexingProgressText.textContent = `File ${status.progress} of ${status.total} (${percent}%)`;
-                                G.els.indexingFileText.textContent = status.current_file || 'Processing...';
+                                const phaseLabel = { starting: 'Starting…', parsing: 'Parsing backups', finalizing: 'Finalizing…', done: 'Done' }[status.phase] || 'Working…';
+                                G.els.indexingProgressText.textContent = `${phaseLabel} — file ${status.progress} of ${status.total} (${percent}%)`;
+                                G.els.indexingFileText.textContent = status.current_file || '';
+                                const counts = `${(status.messages_indexed || 0).toLocaleString()} messages · ${(status.media_extracted || 0).toLocaleString()} media`;
+                                G.els.indexingCountsText.textContent = status.date_range ? `${counts} · ${status.date_range}` : counts;
                             }
                         } catch (e) {
                             clearInterval(interval);
@@ -342,6 +353,45 @@
                             G.els.rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
                         }
                     }, 500);
+                },
+                handleCacheStatus: async (cache) => {
+                    switch (cache.status) {
+                        case 'ready':
+                            await actions.loadInitialData();
+                            break;
+                        case 'stale':
+                            if (confirm('Your backup files have changed since this archive was last indexed.\n\nRebuild the index now to include the changes?\n\n(Cancel = open the existing index as-is.)')) {
+                                actions.startIndexing(true);
+                            } else {
+                                await actions.loadInitialData();
+                            }
+                            break;
+                        case 'outdated':
+                        case 'corrupt':
+                            // Existing cache is unusable — rebuild automatically.
+                            actions.startIndexing(true);
+                            break;
+                        case 'absent':
+                        default:
+                            actions.startIndexing(false);
+                            break;
+                    }
+                },
+                exportMedia: async () => {
+                    if (!confirm('Export all extracted media into an "mms_media" folder (organized by sender) inside your archive folder?')) return;
+                    const btn = G.els.exportMediaBtn;
+                    const original = btn.textContent;
+                    btn.disabled = true;
+                    btn.textContent = 'Exporting…';
+                    try {
+                        const r = await api.post('/api/export-media', {});
+                        alert(`Exported ${r.exported.toLocaleString()} media files to:\n${r.destination}`);
+                    } catch (e) {
+                        alert(`Export failed: ${e.message}`);
+                    } finally {
+                        btn.disabled = false;
+                        btn.textContent = original;
+                    }
                 },
                 handleSearch: async () => {
                     const query = G.els.searchInput.value.trim();
@@ -401,12 +451,7 @@
                     const response = await api.post('/api/set-directory', { path });
                     G.els.modalContainer.classList.add('hidden');
                     G.els.mainUI.classList.remove('hidden');
-
-                    if (response.db_exists) {
-                        await actions.loadInitialData();
-                    } else {
-                        await actions.startIndexing();
-                    }
+                    await actions.handleCacheStatus(response.cache || { status: 'absent' });
                 } catch(e) {
                     G.els.modalError.textContent = `Error: ${e.message}. Please check the path and server console.`;
                     G.els.modalError.classList.remove('hidden');
@@ -416,6 +461,29 @@
             G.els.rebuildIndexBtn.addEventListener('click', () => {
                 if (confirm('Are you sure you want to delete the existing index and rebuild it from scratch? This can be slow.')) {
                     actions.startIndexing(true);
+                }
+            });
+
+            G.els.exportMediaBtn.addEventListener('click', actions.exportMedia);
+
+            G.els.browseFolderBtn.addEventListener('click', async () => {
+                const btn = G.els.browseFolderBtn;
+                const original = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = 'Opening…';
+                try {
+                    const start = G.els.dirPathInput.value.trim();
+                    const r = await api.post('/api/browse-folder', { start });
+                    if (r.path) {
+                        G.els.dirPathInput.value = r.path;
+                        G.els.modalError.classList.add('hidden');
+                    }
+                } catch (e) {
+                    G.els.modalError.textContent = `Could not open the folder picker: ${e.message}. You can paste a path instead.`;
+                    G.els.modalError.classList.remove('hidden');
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = original;
                 }
             });
             
