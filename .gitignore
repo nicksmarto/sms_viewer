@@ -1,0 +1,31 @@
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# ── Secrets & environment ─────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Generated database / search index ─────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── macOS / logs / editor cruft ───────────────────────
+.DS_Store
+*.log
+oneshot.txt
+
+# ── PRIVATE DATA — never commit real message archives ──
+# Real SMS/MMS backups, extracted media, and contacts stay
+# on disk locally so the app runs, but must NEVER be tracked.
+mms_media/
+test/mms_media/
+*.xml
+test/*.xml
+contacts.csv
+test/contacts.csv
+test/*.db

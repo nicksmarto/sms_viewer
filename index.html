@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMS Backup Viewer v2.1</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Simple scrollbar styling */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        .conversation-item.active { background-color: #3b82f6; }
+        .image-modal { backdrop-filter: blur(4px); }
+        .image-modal img { max-width: 90vw; max-height: 90vh; object-fit: contain; }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 font-sans antialiased">
+    <div id="app" class="flex h-screen w-screen overflow-hidden">
+        
+        <!-- Modal for directory selection -->
+        <div id="modal-container" class="fixed inset-0 bg-gray-900 bg-opacity-80 flex items-center justify-center z-50">
+            <div class="bg-gray-800 p-8 rounded-lg shadow-2xl max-w-lg w-full">
+                <h2 class="text-2xl font-bold mb-4 text-white">Welcome to SMS Backup Viewer</h2>
+                <p class="mb-6 text-gray-400">Please provide the absolute path to the directory containing your <code class="bg-gray-700 text-emerald-400 px-1 rounded">.xml</code> backup files.</p>
+                <input type="text" id="dir-path-input" placeholder="e.g., /Users/yourname/Documents/SMSBackups" class="w-full bg-gray-900 border border-gray-700 text-white rounded-md px-4 py-2 mb-4 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                <button id="submit-dir-path" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors">Set Directory & Load</button>
+                <div id="modal-error" class="text-red-400 mt-4 text-sm hidden"></div>
+            </div>
+        </div>
+
+        <!-- Image modal for MMS viewing -->
+        <div id="image-modal" class="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-60 hidden image-modal">
+            <div class="relative">
+                <img id="modal-image" src="" alt="MMS Image" class="rounded-lg">
+                <button id="close-image-modal" class="absolute top-4 right-4 bg-black bg-opacity-50 text-white rounded-full w-8 h-8 flex items-center justify-center hover:bg-opacity-70">×</button>
+            </div>
+        </div>
+
+        <div id="main-ui" class="flex h-full w-full hidden">
+            <!-- Sidebar with conversations -->
+            <aside class="w-1/3 xl:w-1/4 bg-gray-800 flex flex-col h-full border-r border-gray-700">
+                <header class="p-4 border-b border-gray-700 flex-shrink-0">
+                    <h1 class="text-xl font-bold">Conversations</h1>
+                    <div class="mt-2 relative">
+                        <input type="search" id="search-input" placeholder="Search all messages..." class="w-full bg-gray-900 text-sm rounded-md pl-8 pr-2 py-1.5 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                        <svg class="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                    </div>
+                </header>
+                <div id="stats-panel" class="p-4 text-xs text-gray-400 border-b border-gray-700 flex-shrink-0 space-y-1"></div>
+                <div id="conversation-list" class="overflow-y-auto flex-grow">
+                </div>
+                <footer class="p-2 border-t border-gray-700 flex-shrink-0">
+                    <button id="rebuild-index-btn" class="w-full text-center text-xs bg-red-800 hover:bg-red-700 text-white font-semibold py-1 px-2 rounded transition-colors">Rebuild Index</button>
+                </footer>
+            </aside>
+
+            <!-- Main content area -->
+            <main id="main-content" class="w-2/3 xl:w-3/4 flex flex-col h-full bg-gray-900">
+                <header id="message-header" class="p-4 border-b border-gray-700 flex-shrink-0">
+                    <h2 id="current-contact" class="font-bold text-lg">Select a conversation</h2>
+                    <p id="current-number" class="text-sm text-gray-400"></p>
+                </header>
+                
+                <div id="message-list" class="flex-grow overflow-y-auto p-4 md:p-6 space-y-4">
+                    <div id="placeholder" class="h-full flex items-center justify-center text-gray-500">
+                        <div class="text-center">
+                            <svg class="w-16 h-16 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                            <p>Select a conversation from the left to view messages.</p>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- Indexing overlay -->
+        <div id="indexing-overlay" class="fixed inset-0 bg-gray-900 bg-opacity-90 z-40 items-center justify-center hidden">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold mb-4 text-white">Indexing Messages...</h2>
+                <p class="text-gray-400">This may take a while for large backups.</p>
+                <div class="w-64 bg-gray-700 rounded-full h-2.5 mx-auto mt-6">
+                    <div id="indexing-progress-bar" class="bg-blue-600 h-2.5 rounded-full" style="width: 0%"></div>
+                </div>
+                <p id="indexing-progress-text" class="mt-2 text-sm text-gray-400">Initializing...</p>
+                <p id="indexing-file-text" class="mt-1 text-xs text-gray-500 truncate w-64 mx-auto"></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // DOM elements
+            const modalContainer = document.getElementById('modal-container');
+            const mainUI = document.getElementById('main-ui');
+            const dirPathInput = document.getElementById('dir-path-input');
+            const submitDirPathBtn = document.getElementById('submit-dir-path');
+            const modalError = document.getElementById('modal-error');
+            const conversationList = document.getElementById('conversation-list');
+            const messageList = document.getElementById('message-list');
+            const placeholder = document.getElementById('placeholder');
+            const currentContact = document.getElementById('current-contact');
+            const currentNumber = document.getElementById('current-number');
+            const statsPanel = document.getElementById('stats-panel');
+            const rebuildIndexBtn = document.getElementById('rebuild-index-btn');
+            const searchInput = document.getElementById('search-input');
+            const imageModal = document.getElementById('image-modal');
+            const modalImage = document.getElementById('modal-image');
+            const closeImageModal = document.getElementById('close-image-modal');
+            
+            const indexingOverlay = document.getElementById('indexing-overlay');
+            const indexingProgressBar = document.getElementById('indexing-progress-bar');
+            const indexingProgressText = document.getElementById('indexing-progress-text');
+            const indexingFileText = document.getElementById('indexing-file-text');
+
+            let searchTimeout;
+
+            // --- API Helper ---
+            const api = {
+                async post(endpoint, body) {
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (!response.ok) {
+                        const error = await response.json();
+                        throw new Error(error.description || 'An unknown error occurred');
+                    }
+                    return response.json();
+                },
+                async get(endpoint) {
+                    const response = await fetch(endpoint);
+                    if (!response.ok) throw new Error('Network response was not ok.');
+                    return response.json();
+                }
+            };
+
+            // --- Image Modal Functions ---
+            const showImageModal = (url) => {
+                modalImage.src = url;
+                imageModal.classList.remove('hidden');
+            };
+
+            const hideImageModal = () => {
+                imageModal.classList.add('hidden');
+                modalImage.src = '';
+            };
+
+            // --- Utility Functions ---
+            const escapeHtml = (text) => {
+                if (text === null || text === undefined) return '';
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            };
+
+            // --- UI Rendering Functions ---
+            const renderConversations = (conversations) => {
+                conversationList.innerHTML = '';
+                if (!conversations || conversations.length === 0) {
+                    conversationList.innerHTML = `<p class="p-4 text-sm text-gray-500">No conversations found.</p>`;
+                    return;
+                }
+                
+                conversations.forEach(conv => {
+                    const item = document.createElement('div');
+                    item.className = 'conversation-item p-4 border-b border-gray-700 cursor-pointer hover:bg-gray-700/50 transition-colors';
+                    item.dataset.address = conv.address;
+                    
+                    const imageIndicator = conv.image_count > 0 ? `📷 ` : '';
+                    const nameDisplay = conv.contact_name || conv.address;
+                    
+                    item.innerHTML = `
+                        <div class="font-bold truncate">${imageIndicator}${escapeHtml(nameDisplay)}</div>
+                        <div class="text-xs text-gray-400">${conv.address} (${conv.message_count}${conv.image_count > 0 ? `, ${conv.image_count} media` : ''})</div>
+                        <div class="text-xs text-gray-500 mt-1">${new Date(conv.last_message_date).toLocaleString()}</div>
+                    `;
+                    
+                    item.addEventListener('click', () => {
+                        document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
+                        item.classList.add('active');
+                        loadMessages(conv.address, nameDisplay);
+                    });
+                    
+                    conversationList.appendChild(item);
+                });
+            };
+
+            const renderMessages = (messages, contactName, address) => {
+                messageList.innerHTML = '';
+                placeholder.classList.add('hidden');
+                currentContact.textContent = contactName;
+                currentNumber.textContent = address;
+
+                if (!messages || messages.length === 0) return;
+
+                messages.forEach(msg => {
+                    const isSent = msg.type === 2;
+                    const wrapper = document.createElement('div');
+                    wrapper.className = `flex ${isSent ? 'justify-end' : 'justify-start'}`;
+                    wrapper.dataset.date = msg.date;
+                    
+                    const bubble = document.createElement('div');
+                    bubble.className = `max-w-md lg:max-w-xl p-3 rounded-lg shadow`;
+                    bubble.classList.add(isSent ? 'bg-blue-600' : 'bg-gray-700');
+
+                    let senderHtml = '';
+                    if (address.includes('~') && !isSent && msg.sender) {
+                        senderHtml = `<div class="text-xs font-bold mb-1 text-gray-400">${escapeHtml(msg.sender)}</div>`;
+                    }
+
+                    let contentHtml = '';
+                    
+                    if (msg.mms_media_path) {
+                        const mediaUrl = `/api/media/${msg.mms_media_path}`;
+                        if (msg.mms_media_type.startsWith('image/')) {
+                            contentHtml += `<div class="mb-2"><img src="${mediaUrl}" class="max-w-xs md:max-w-sm rounded-lg border border-gray-600 cursor-pointer" onclick="showImageModal('${mediaUrl}')"></div>`;
+                        } else if (msg.mms_media_type.startsWith('video/')) {
+                            contentHtml += `<div class="mb-2"><video controls class="max-w-xs md:max-w-sm rounded-lg border border-gray-600"><source src="${mediaUrl}" type="${msg.mms_media_type}"></video></div>`;
+                        } else if (msg.mms_media_type.startsWith('audio/')) {
+                            contentHtml += `<div class="my-2"><audio controls src="${mediaUrl}" class="w-full"></audio></div>`;
+                        }
+                    }
+                    
+                    if (msg.body && msg.body.trim()) {
+                        contentHtml += `<p class="text-sm">${escapeHtml(msg.body)}</p>`;
+                    }
+                    
+                    if (!contentHtml.trim()) {
+                        contentHtml = `<p class="text-sm text-gray-400 italic">[Empty message]</p>`;
+                    }
+                    
+                    bubble.innerHTML = `${senderHtml}${contentHtml}<div class="text-xs mt-2 text-right ${isSent ? 'text-blue-200' : 'text-gray-400'}">${msg.readable_date}</div>`;
+                    
+                    wrapper.appendChild(bubble);
+                    messageList.appendChild(wrapper);
+                });
+                
+                setTimeout(() => { messageList.scrollTop = messageList.scrollHeight; }, 0);
+            };
+            
+            const renderSearchResults = (results) => {
+                messageList.innerHTML = '';
+                placeholder.classList.add('hidden');
+                currentContact.textContent = `Search Results for "${searchInput.value}"`;
+                currentNumber.textContent = `${results.length} matches found`;
+                
+                if (results.length === 0) {
+                    messageList.innerHTML = `<div class="text-center text-gray-500">No results found.</div>`;
+                    return;
+                }
+
+                results.forEach(msg => {
+                    const item = document.createElement('div');
+                    item.className = `p-3 rounded-lg shadow border border-gray-700 bg-gray-800 cursor-pointer hover:bg-gray-700/50 transition-colors`;
+                    item.addEventListener('click', () => jumpToMessage(msg.address, msg.date, msg.contact_name));
+                    
+                    let contentHtml = '';
+                    if (msg.mms_media_path && msg.mms_media_type.startsWith('image/')) {
+                        contentHtml += `<div class="mb-2"><img src="/api/media/${msg.mms_media_path}" class="max-w-xs rounded-lg border border-gray-600"></div>`;
+                    }
+                    if (msg.body && msg.body.trim()) {
+                        contentHtml += `<p class="text-sm text-gray-300">${escapeHtml(msg.body)}</p>`;
+                    }
+                    
+                    item.innerHTML = `
+                        <div class="flex justify-between items-baseline mb-2">
+                           <div class="font-bold text-sm">${escapeHtml(msg.contact_name)}</div>
+                           <div class="text-xs text-gray-400">${msg.readable_date}</div>
+                        </div>
+                        ${contentHtml}
+                    `;
+                    messageList.appendChild(item);
+                });
+            };
+
+            const jumpToMessage = async (address, date, contactName) => {
+                document.querySelectorAll('.conversation-item').forEach(el => {
+                    el.classList.toggle('active', el.dataset.address === address);
+                });
+                await loadMessages(address, contactName);
+                setTimeout(() => {
+                    const messageToHighlight = messageList.querySelector(`[data-date="${date}"]`);
+                    if (messageToHighlight) {
+                        messageToHighlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        const bubble = messageToHighlight.querySelector('.max-w-md');
+                        if (bubble) {
+                            bubble.classList.add('ring-2', 'ring-yellow-400');
+                            setTimeout(() => { bubble.classList.remove('ring-2', 'ring-yellow-400'); }, 2500);
+                        }
+                    }
+                }, 100);
+            };
+
+            const updateStats = async () => {
+                try {
+                    const stats = await api.get('/api/stats');
+                    statsPanel.innerHTML = `
+                        <div>Messages: <strong class="text-white">${stats.total_messages.toLocaleString()}</strong></div>
+                        <div>Conversations: <strong class="text-white">${stats.total_conversations.toLocaleString()}</strong> (${stats.total_with_names} with names)</div>
+                        <div>MMS Media: <strong class="text-white">${stats.total_mms_images.toLocaleString()}</strong></div>
+                        <div>DB Size: <strong class="text-white">${stats.db_size_mb} MB</strong></div>
+                    `;
+                } catch (e) {
+                    statsPanel.innerHTML = `<p class="text-red-400">Could not load stats.</p>`;
+                }
+            };
+            
+            const showIndexingOverlay = (show) => {
+                indexingOverlay.style.display = show ? 'flex' : 'none';
+            };
+
+            const pollIndexingStatus = () => {
+                rebuildIndexBtn.disabled = true;
+                rebuildIndexBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                const interval = setInterval(async () => {
+                    try {
+                        const status = await api.get('/api/indexing-status');
+                        if (!status.running) {
+                            clearInterval(interval);
+                            showIndexingOverlay(false);
+                            loadInitialData();
+                            rebuildIndexBtn.disabled = false;
+                            rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                        } else {
+                            const percent = status.total > 0 ? Math.round((status.progress / status.total) * 100) : 0;
+                            indexingProgressBar.style.width = `${percent}%`;
+                            indexingProgressText.textContent = `File ${status.progress} of ${status.total} (${percent}%)`;
+                            indexingFileText.textContent = status.current_file || 'Processing...';
+                        }
+                    } catch (e) {
+                        clearInterval(interval);
+                        showIndexingOverlay(false);
+                        alert("An error occurred during indexing. Please check the console and try again.");
+                        rebuildIndexBtn.disabled = false;
+                        rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    }
+                }, 500);
+            };
+
+            const startIndexing = async (rebuild = false) => {
+                try {
+                    await api.post('/api/start-indexing', { rebuild });
+                    showIndexingOverlay(true);
+                    pollIndexingStatus();
+                } catch (e) {
+                    alert(`Error starting indexing: ${e.message}`);
+                }
+            };
+
+            const loadInitialData = async () => {
+                try {
+                    const conversations = await api.get('/api/conversations');
+                    renderConversations(conversations);
+                    await updateStats();
+                } catch (error) {
+                    console.error('Failed to load initial data:', error);
+                }
+            };
+
+            const loadMessages = async (address, contactName) => {
+                try {
+                    const messages = await api.get(`/api/messages/${encodeURIComponent(address)}`);
+                    renderMessages(messages, contactName, address);
+                } catch (error) {
+                    console.error('Failed to load messages:', error);
+                }
+            };
+            
+            const handleSearch = async () => {
+                const query = searchInput.value.trim();
+                if (query.length < 3) {
+                    if (document.querySelector('.conversation-item.active')) {
+                        const activeConv = document.querySelector('.conversation-item.active');
+                        loadMessages(activeConv.dataset.address, activeConv.querySelector('.font-bold').textContent);
+                    } else {
+                        messageList.innerHTML = '';
+                        placeholder.classList.remove('hidden');
+                        currentContact.textContent = 'Select a conversation';
+                        currentNumber.textContent = '';
+                    }
+                    return;
+                }
+                
+                try {
+                    const results = await api.get(`/api/search?q=${encodeURIComponent(query)}`);
+                    renderSearchResults(results);
+                } catch (error) {
+                    console.error('Search failed:', error);
+                    messageList.innerHTML = `<div class="text-center text-red-400">Search failed.</div>`;
+                }
+            };
+
+            window.showImageModal = (url) => {
+                modalImage.src = url;
+                imageModal.classList.remove('hidden');
+            };
+
+            // --- Event Listeners ---
+            submitDirPathBtn.addEventListener('click', async () => {
+                const path = dirPathInput.value.trim();
+                if (!path) {
+                    modalError.textContent = 'Path cannot be empty.';
+                    modalError.classList.remove('hidden');
+                    return;
+                }
+                
+                try {
+                    const response = await api.post('/api/set-directory', { path });
+                    modalContainer.classList.add('hidden');
+                    mainUI.classList.remove('hidden');
+
+                    if (response.db_exists) {
+                        await loadInitialData();
+                    } else {
+                        await startIndexing();
+                    }
+                } catch(e) {
+                    modalError.textContent = `Error: ${e.message}. Please check the path and server console.`;
+                    modalError.classList.remove('hidden');
+                }
+            });
+            
+            rebuildIndexBtn.addEventListener('click', () => {
+                if (confirm('Are you sure you want to delete the existing index and rebuild it from scratch? This can be slow.')) {
+                    startIndexing(true);
+                }
+            });
+            
+            searchInput.addEventListener('keyup', () => {
+                clearTimeout(searchTimeout);
+                searchTimeout = setTimeout(handleSearch, 300);
+            });
+
+            closeImageModal.addEventListener('click', hideImageModal);
+            imageModal.addEventListener('click', (e) => {
+                if (e.target === imageModal) {
+                    hideImageModal();
+                }
+            });
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    hideImageModal();
+                }
+            });
+
+        });
+    </script>
+</body>
+</html>
