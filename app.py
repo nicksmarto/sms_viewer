@@ -350,7 +350,11 @@ def process_xml_files():
                         total_mms_count += 1
                         
                         participant_nodes = elem.findall(".//addr")
-                        participant_addrs = {normalize_number(addr.get('address')) for addr in participant_nodes if addr.get('address')}
+                        participant_addrs = set()
+                        for addr in participant_nodes:
+                            address_val = addr.get('address')
+                            if address_val and not re.search('[a-zA-Z]', address_val):
+                                participant_addrs.add(normalize_number(address_val))
                         
                         my_number = '' # This should be configurable
                         participant_addrs.discard(my_number)
