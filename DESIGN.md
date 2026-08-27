@@ -34,7 +34,10 @@ everything as a familiar, searchable messaging UI — entirely offline.
   backups pristine and — critically — avoids SQLite "disk I/O error" failures on
   cloud-synced filesystems like Google Drive, where the archives often live.
 - **Content-hash de-duplication.** Overlapping backups repeat the same messages and media.
-  Messages are de-duplicated by a stable hash; media by the SHA-256 of the file bytes,
+  Messages are de-duplicated by a hash of their *normalized* fields (the sorted participant
+  list, timestamp, direction, body, and normalized sender) — never the raw address, since
+  different backup apps format the same number differently ("(412) 656-4424" vs "4126564424")
+  and reorder group participants. Media is de-duplicated by the SHA-256 of the file bytes,
   keeping the first occurrence found.
 - **Timestamps reflect when the media was received.** Each extracted media file's
   *filesystem* modification time is set to the message's date (superseding the extraction

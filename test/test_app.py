@@ -66,6 +66,41 @@ class TestIndexing(unittest.TestCase):
             msg="Media file mtime does not match the message time.",
         )
 
+    def test_no_duplicate_messages_across_overlapping_archives(self):
+        """Overlapping backups (the same history exported more than once, often
+        with the number formatted differently or group participants in a
+        different order) must collapse to a single row per logical message.
+        Regression test for de-duplication built on the raw address."""
+        conn = get_db_connection()
+        try:
+            # Text rows: identity is (conversation, time, direction, body, sender).
+            text_dupes = conn.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM messages
+                    WHERE mms_media_path IS NULL
+                    GROUP BY participants, date, type,
+                             IFNULL(body, ''), IFNULL(sender_address, '')
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+            # Media rows: identity also includes the specific media file.
+            media_dupes = conn.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM messages
+                    WHERE mms_media_path IS NOT NULL
+                    GROUP BY participants, date, type, mms_media_path
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(text_dupes, 0, "Duplicate text messages were indexed.")
+        self.assertEqual(media_dupes, 0, "Duplicate media messages were indexed.")
+
     def test_cache_meta_written(self):
         conn = get_db_connection()
         try:

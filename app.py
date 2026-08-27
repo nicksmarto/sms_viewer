@@ -24,7 +24,10 @@ DB_NAME = 'sms_messages.db'
 
 # Bump this whenever the cache layout or DB schema changes in a way that makes
 # an old cache unusable. assess_cache() rebuilds automatically on a mismatch.
-CACHE_FORMAT_VERSION = 2
+# v3: unique_hash now derives from normalized fields (participants/sender)
+#     instead of the raw address, so overlapping archives de-duplicate
+#     correctly. Old caches hold duplicate rows and must be rebuilt.
+CACHE_FORMAT_VERSION = 3
 
 # Your own phone number (digits only), used to identify "you" in group
 # conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
@@ -405,7 +408,26 @@ def normalize_number(phone_number):
     return digits_only
 
 def generate_unique_hash(msg, part_identifier=""):
-    data = f"{msg.get('address', '')}-{msg.get('date', '')}-{msg.get('body', '')}-{msg.get('type', '')}-{msg.get('sender','')}-{part_identifier}"
+    """Stable identity for a logical message, used to de-duplicate across
+    overlapping archives (the same conversation history often lands in several
+    backups — e.g. carried between phones by a restore).
+
+    Built ONLY from NORMALIZED fields, never the raw `address`: different
+    backup apps / phones format the same number differently ('(412) 656-4424'
+    vs '4126564424') and list group participants in a different order
+    ('A~B' vs 'B~A'). The raw address therefore varies for what is really the
+    same message, which defeated de-duplication. `participants` is already
+    normalized and sorted, and `sender_address` is already normalized, so the
+    same message hashes identically no matter which archive it came from.
+    """
+    data = "-".join(str(x) for x in (
+        msg.get('participants', '') or '',
+        msg.get('date', '') or '',
+        msg.get('body', '') or '',
+        msg.get('type', '') or '',
+        msg.get('sender_address', '') or '',
+        part_identifier,
+    ))
     return hashlib.sha256(data.encode('utf-8')).hexdigest()
 
 def safe_b64_decode(s: str) -> bytes:
