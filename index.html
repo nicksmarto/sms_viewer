@@ -51,7 +51,8 @@
                 <div id="stats-panel" class="p-4 text-xs text-gray-400 border-b border-gray-700 flex-shrink-0 space-y-1"></div>
                 <div id="conversation-list" class="overflow-y-auto flex-grow">
                 </div>
-                <footer class="p-2 border-t border-gray-700 flex-shrink-0">
+                <footer class="p-2 border-t border-gray-700 flex-shrink-0 space-y-2">
+                    <button id="export-media-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">⬇︎ Export media to folder…</button>
                     <button id="rebuild-index-btn" class="w-full text-center text-xs bg-red-800 hover:bg-red-700 text-white font-semibold py-1 px-2 rounded transition-colors">Rebuild Index</button>
                 </footer>
             </aside>
@@ -84,6 +85,7 @@
                 </div>
                 <p id="indexing-progress-text" class="mt-2 text-sm text-gray-400">Initializing...</p>
                 <p id="indexing-file-text" class="mt-1 text-xs text-gray-500 truncate w-64 mx-auto"></p>
+                <p id="indexing-counts-text" class="mt-1 text-xs text-blue-300"></p>
             </div>
         </div>
     </div>
@@ -104,6 +106,7 @@
                     currentNumber: document.getElementById('current-number'),
                     statsPanel: document.getElementById('stats-panel'),
                     rebuildIndexBtn: document.getElementById('rebuild-index-btn'),
+                    exportMediaBtn: document.getElementById('export-media-btn'),
                     searchInput: document.getElementById('search-input'),
                     imageModal: document.getElementById('image-modal'),
                     modalImage: document.getElementById('modal-image'),
@@ -112,6 +115,7 @@
                     indexingProgressBar: document.getElementById('indexing-progress-bar'),
                     indexingProgressText: document.getElementById('indexing-progress-text'),
                     indexingFileText: document.getElementById('indexing-file-text'),
+                    indexingCountsText: document.getElementById('indexing-counts-text'),
                 },
                 state: {
                     searchTimeout: null,
@@ -331,8 +335,11 @@
                             } else {
                                 const percent = status.total > 0 ? Math.round((status.progress / status.total) * 100) : 0;
                                 G.els.indexingProgressBar.style.width = `${percent}%`;
-                                G.els.indexingProgressText.textContent = `File ${status.progress} of ${status.total} (${percent}%)`;
-                                G.els.indexingFileText.textContent = status.current_file || 'Processing...';
+                                const phaseLabel = { starting: 'Starting…', parsing: 'Parsing backups', finalizing: 'Finalizing…', done: 'Done' }[status.phase] || 'Working…';
+                                G.els.indexingProgressText.textContent = `${phaseLabel} — file ${status.progress} of ${status.total} (${percent}%)`;
+                                G.els.indexingFileText.textContent = status.current_file || '';
+                                const counts = `${(status.messages_indexed || 0).toLocaleString()} messages · ${(status.media_extracted || 0).toLocaleString()} media`;
+                                G.els.indexingCountsText.textContent = status.date_range ? `${counts} · ${status.date_range}` : counts;
                             }
                         } catch (e) {
                             clearInterval(interval);
@@ -342,6 +349,45 @@
                             G.els.rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
                         }
                     }, 500);
+                },
+                handleCacheStatus: async (cache) => {
+                    switch (cache.status) {
+                        case 'ready':
+                            await actions.loadInitialData();
+                            break;
+                        case 'stale':
+                            if (confirm('Your backup files have changed since this archive was last indexed.\n\nRebuild the index now to include the changes?\n\n(Cancel = open the existing index as-is.)')) {
+                                actions.startIndexing(true);
+                            } else {
+                                await actions.loadInitialData();
+                            }
+                            break;
+                        case 'outdated':
+                        case 'corrupt':
+                            // Existing cache is unusable — rebuild automatically.
+                            actions.startIndexing(true);
+                            break;
+                        case 'absent':
+                        default:
+                            actions.startIndexing(false);
+                            break;
+                    }
+                },
+                exportMedia: async () => {
+                    if (!confirm('Export all extracted media into an "mms_media" folder (organized by sender) inside your archive folder?')) return;
+                    const btn = G.els.exportMediaBtn;
+                    const original = btn.textContent;
+                    btn.disabled = true;
+                    btn.textContent = 'Exporting…';
+                    try {
+                        const r = await api.post('/api/export-media', {});
+                        alert(`Exported ${r.exported.toLocaleString()} media files to:\n${r.destination}`);
+                    } catch (e) {
+                        alert(`Export failed: ${e.message}`);
+                    } finally {
+                        btn.disabled = false;
+                        btn.textContent = original;
+                    }
                 },
                 handleSearch: async () => {
                     const query = G.els.searchInput.value.trim();
@@ -401,12 +447,7 @@
                     const response = await api.post('/api/set-directory', { path });
                     G.els.modalContainer.classList.add('hidden');
                     G.els.mainUI.classList.remove('hidden');
-
-                    if (response.db_exists) {
-                        await actions.loadInitialData();
-                    } else {
-                        await actions.startIndexing();
-                    }
+                    await actions.handleCacheStatus(response.cache || { status: 'absent' });
                 } catch(e) {
                     G.els.modalError.textContent = `Error: ${e.message}. Please check the path and server console.`;
                     G.els.modalError.classList.remove('hidden');
@@ -418,6 +459,8 @@
                     actions.startIndexing(true);
                 }
             });
+
+            G.els.exportMediaBtn.addEventListener('click', actions.exportMedia);
             
             G.els.searchInput.addEventListener('keyup', () => {
                 clearTimeout(G.state.searchTimeout);
