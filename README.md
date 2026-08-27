@@ -140,6 +140,11 @@ This is deliberate: it keeps your backups untouched and avoids database errors o
 cloud-synced folders (e.g. Google Drive), where SQLite can't run reliably. The cache is
 disposable — delete it, or click **Rebuild Index**, and it regenerates from your XML.
 
+Each archive you open adds its own cache (rebuilding one *replaces* it, it doesn't pile
+up). To see every cache's size and source, delete individual ones, or clear caches whose
+source folder no longer exists, open **Manage cached indexes** — on the welcome screen or
+in the sidebar footer.
+
 For a browsable, sender-organized copy of your media saved *into* your archive folder, use
 the **Export media to folder** button in the app.
 

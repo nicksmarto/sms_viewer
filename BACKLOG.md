@@ -39,6 +39,9 @@ GitHub, these can graduate into GitHub Issues (one issue per item).
   folder. Fixes the Google Drive "disk I/O error" and stops polluting the backups.
 - ✅ **Cache lifecycle** — detect presence, integrity, cache-format version, and whether
   the source backups changed; reuse a healthy cache, rebuild automatically when not.
+- ✅ **Cache management** — a "Manage cached indexes" panel to list every cache (source,
+  size, message count, date), delete individual ones, and clear caches whose source folder
+  is gone; guarded against path traversal.
 - ✅ SQLite robustness (WAL mode + busy timeout).
 - ✅ Richer indexing progress in the UI (phase, file x/N, live message/media counts, date range).
 - ✅ On-demand **Export media to folder** button (writes the browsable, sender-organized
