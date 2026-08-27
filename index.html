@@ -60,15 +60,19 @@
                 <footer class="p-2 border-t border-gray-700 flex-shrink-0 space-y-2">
                     <button id="export-media-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">⬇︎ Export media to folder…</button>
                     <button id="manage-caches-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">🗄 Manage cached indexes…</button>
+                    <button id="manage-spam-btn" class="w-full text-center text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1 px-2 rounded transition-colors">🚫 Manage spam numbers…</button>
                     <button id="rebuild-index-btn" class="w-full text-center text-xs bg-red-800 hover:bg-red-700 text-white font-semibold py-1 px-2 rounded transition-colors">Rebuild Index</button>
                 </footer>
             </aside>
 
             <!-- Main content area -->
             <main id="main-content" class="w-2/3 xl:w-3/4 flex flex-col h-full bg-gray-900">
-                <header id="message-header" class="p-4 border-b border-gray-700 flex-shrink-0">
-                    <h2 id="current-contact" class="font-bold text-lg">Select a conversation</h2>
-                    <p id="current-number" class="text-sm text-gray-400"></p>
+                <header id="message-header" class="p-4 border-b border-gray-700 flex-shrink-0 flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <h2 id="current-contact" class="font-bold text-lg truncate">Select a conversation</h2>
+                        <p id="current-number" class="text-sm text-gray-400"></p>
+                    </div>
+                    <button id="mark-spam-btn" class="hidden flex-shrink-0 text-xs bg-gray-700 hover:bg-red-800 text-white font-semibold py-1.5 px-3 rounded transition-colors" title="Add this conversation's number to the spam list">🚫 Mark as spam</button>
                 </header>
                 
                 <div id="message-list" class="flex-grow overflow-y-auto p-4 md:p-6 space-y-4">
@@ -97,6 +101,21 @@
                     <div class="text-sm text-gray-300">Total: <strong id="cache-total" class="text-white">—</strong></div>
                     <button id="prune-caches-btn" class="text-xs bg-yellow-700 hover:bg-yellow-600 text-white font-semibold py-1.5 px-3 rounded transition-colors">Clear unused caches</button>
                 </div>
+            </div>
+        </div>
+
+        <!-- Spam management modal -->
+        <div id="spam-modal" class="fixed inset-0 bg-gray-900 bg-opacity-80 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-800 p-6 rounded-lg shadow-2xl max-w-2xl w-full flex flex-col" style="max-height: 80vh;">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-xl font-bold text-white">Spam numbers</h2>
+                    <button id="close-spam-modal" class="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
+                </div>
+                <p class="text-sm text-gray-400 mb-4">These numbers are hidden from your conversation list. The list is saved in
+                    <code id="spam-file-path" class="bg-gray-700 px-1 rounded text-emerald-400 text-xs"></code>
+                    inside your archive folder, so it travels with your backups. A number that's also in your contacts is
+                    <strong>shown anyway</strong> — contacts always win.</p>
+                <div id="spam-list" class="overflow-y-auto flex-grow space-y-2 mb-4 min-h-[4rem]"></div>
             </div>
         </div>
 
@@ -150,10 +169,18 @@
                     pruneCachesBtn: document.getElementById('prune-caches-btn'),
                     welcomeManageCaches: document.getElementById('welcome-manage-caches'),
                     manageCachesBtn: document.getElementById('manage-caches-btn'),
+                    markSpamBtn: document.getElementById('mark-spam-btn'),
+                    manageSpamBtn: document.getElementById('manage-spam-btn'),
+                    spamModal: document.getElementById('spam-modal'),
+                    closeSpamModal: document.getElementById('close-spam-modal'),
+                    spamList: document.getElementById('spam-list'),
+                    spamFilePath: document.getElementById('spam-file-path'),
                 },
                 state: {
                     searchTimeout: null,
                     isSearching: false,
+                    currentAddress: null,
+                    currentName: null,
                 }
             };
 
@@ -334,6 +361,9 @@
                     try {
                         const messages = await api.get(`/api/messages/${conversationId}`);
                         render.messages(messages, conversationName);
+                        G.state.currentAddress = conversationId;
+                        G.state.currentName = conversationName;
+                        G.els.markSpamBtn.classList.remove('hidden');
                     } catch (error) {
                         console.error('Failed to load messages:', error);
                     }
@@ -345,6 +375,7 @@
                             <div>Messages: <strong class="text-white">${stats.total_messages.toLocaleString()}</strong></div>
                             <div>Conversations: <strong class="text-white">${stats.total_conversations.toLocaleString()}</strong> (${stats.total_with_names} contacts)</div>
                             <div>MMS Media: <strong class="text-white">${stats.total_mms_images.toLocaleString()}</strong></div>
+                            ${stats.date_range ? `<div>Dates: <strong class="text-white">${stats.date_range}</strong></div>` : ''}
                             <div>DB Size: <strong class="text-white">${stats.db_size_mb} MB</strong></div>
                         `;
                     } catch (e) {
@@ -453,8 +484,9 @@
                         if (cache.is_current) badges.push(`<span class="text-xs bg-blue-700 text-white px-1.5 py-0.5 rounded">in use now</span>`);
                         if (!cache.source_exists) badges.push(`<span class="text-xs bg-yellow-700 text-white px-1.5 py-0.5 rounded">source folder missing</span>`);
                         const msgs = cache.message_count ? `${Number(cache.message_count).toLocaleString()} messages` : '';
+                        const dates = cache.date_range ? `covers ${cache.date_range}` : '';
                         const when = cache.indexed_at ? `indexed ${cache.indexed_at.replace('T', ' ')}` : '';
-                        const meta = [utils.formatBytes(cache.size_bytes), msgs, when].filter(Boolean).join(' · ');
+                        const meta = [utils.formatBytes(cache.size_bytes), msgs, dates, when].filter(Boolean).join(' · ');
 
                         const item = document.createElement('div');
                         item.className = 'bg-gray-900 rounded-md p-3 flex items-center justify-between gap-3';
@@ -488,6 +520,66 @@
                         alert(r.removed.length ? `Cleared ${r.removed.length} unused cache(s), freed ${utils.formatBytes(r.freed_bytes)}.` : 'No unused caches to clear.');
                     } catch (e) {
                         alert(`Could not clear caches: ${e.message}`);
+                    }
+                },
+                markCurrentAsSpam: async () => {
+                    if (!G.state.currentAddress) return;
+                    const label = G.state.currentName || G.state.currentAddress;
+                    if (!confirm(`Mark "${label}" as spam?\n\nIts number(s) will be added to spamnumbers.txt and hidden from your conversation list. If the number is in your contacts it will still be shown. You can undo this any time in "Manage spam numbers".`)) return;
+                    try {
+                        await api.post('/api/spam/add', { participants: G.state.currentAddress });
+                        G.els.markSpamBtn.classList.add('hidden');
+                        G.els.messageList.innerHTML = '';
+                        G.els.placeholder.classList.remove('hidden');
+                        G.els.currentContact.textContent = 'Select a conversation';
+                        G.els.currentNumber.textContent = '';
+                        G.state.currentAddress = null;
+                        await actions.loadInitialData();
+                    } catch (e) {
+                        alert(`Could not mark as spam: ${e.message}`);
+                    }
+                },
+                openSpamManager: async () => {
+                    G.els.spamModal.classList.remove('hidden');
+                    G.els.spamList.innerHTML = `<p class="text-sm text-gray-500 p-2">Loading…</p>`;
+                    try {
+                        actions.renderSpam(await api.get('/api/spam'));
+                    } catch (e) {
+                        G.els.spamList.innerHTML = `<p class="text-sm text-red-400 p-2">Could not load spam list: ${e.message}</p>`;
+                    }
+                },
+                renderSpam: (data) => {
+                    G.els.spamFilePath.textContent = data.file || 'spamnumbers.txt';
+                    if (!data.spam || data.spam.length === 0) {
+                        G.els.spamList.innerHTML = `<p class="text-sm text-gray-500 p-2">No spam numbers yet. Use "Mark as spam" in a conversation to add one.</p>`;
+                        return;
+                    }
+                    G.els.spamList.innerHTML = '';
+                    data.spam.forEach(item => {
+                        const badge = item.whitelisted
+                            ? `<span class="text-xs bg-green-800 text-white px-1.5 py-0.5 rounded">shown anyway · contact: ${utils.escapeHtml(item.contact_name)}</span>`
+                            : '';
+                        const el = document.createElement('div');
+                        el.className = 'bg-gray-900 rounded-md p-3 flex items-center justify-between gap-3';
+                        el.innerHTML = `
+                            <div class="min-w-0 flex items-center gap-2 flex-wrap">
+                                <span class="text-sm text-white font-mono">${utils.escapeHtml(item.number)}</span> ${badge}
+                            </div>
+                            <button class="spam-remove-btn flex-shrink-0 text-xs bg-gray-700 hover:bg-gray-600 text-white font-semibold py-1.5 px-3 rounded" data-number="${utils.escapeHtml(item.number)}">Remove</button>
+                        `;
+                        el.querySelector('.spam-remove-btn').addEventListener('click', () => actions.removeSpam(item.number));
+                        G.els.spamList.appendChild(el);
+                    });
+                },
+                removeSpam: async (number) => {
+                    try {
+                        await api.post('/api/spam/remove', { number });
+                        actions.renderSpam(await api.get('/api/spam'));
+                        if (!G.els.mainUI.classList.contains('hidden') && !G.state.isSearching) {
+                            actions.loadInitialData();
+                        }
+                    } catch (e) {
+                        alert(`Could not remove: ${e.message}`);
                     }
                 },
                 handleSearch: async () => {
@@ -597,6 +689,13 @@
                 if (e.target === G.els.cacheModal) G.els.cacheModal.classList.add('hidden');
             });
 
+            G.els.markSpamBtn.addEventListener('click', actions.markCurrentAsSpam);
+            G.els.manageSpamBtn.addEventListener('click', actions.openSpamManager);
+            G.els.closeSpamModal.addEventListener('click', () => G.els.spamModal.classList.add('hidden'));
+            G.els.spamModal.addEventListener('click', (e) => {
+                if (e.target === G.els.spamModal) G.els.spamModal.classList.add('hidden');
+            });
+
             G.els.closeImageModal.addEventListener('click', utils.hideImageModal);
             G.els.imageModal.addEventListener('click', (e) => {
                 if (e.target === G.els.imageModal) utils.hideImageModal();
@@ -606,6 +705,7 @@
                 if (e.key === 'Escape') {
                     utils.hideImageModal();
                     G.els.cacheModal.classList.add('hidden');
+                    G.els.spamModal.classList.add('hidden');
                 }
             });
         });

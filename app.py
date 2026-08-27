@@ -127,8 +127,107 @@ def list_caches():
             'message_count': meta.get('message_count', ''),
             'size_bytes': _dir_size_bytes(cdir),
             'is_current': bool(current_dir) and os.path.abspath(cdir) == os.path.abspath(current_dir),
+            'date_range': _cache_date_range(db_path, meta),
         })
     return caches
+
+
+def _fmt_date(ms):
+    """Epoch milliseconds -> 'YYYY-MM-DD' (or '' on bad input)."""
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000.0).strftime('%Y-%m-%d')
+    except (ValueError, TypeError, OSError):
+        return ''
+
+
+def _cache_date_range(db_path, meta):
+    """Human date span for a cache: prefer stored meta, fall back to a query."""
+    dmin, dmax = meta.get('date_min'), meta.get('date_max')
+    if not dmin or not dmax:
+        try:
+            conn = sqlite3.connect(db_path, timeout=5)
+            r = conn.execute('SELECT MIN(date), MAX(date) FROM messages').fetchone()
+            conn.close()
+            dmin, dmax = (r[0], r[1]) if r else (None, None)
+        except sqlite3.Error:
+            return ''
+    a, b = _fmt_date(dmin), _fmt_date(dmax)
+    return f"{a} to {b}" if a and b else ''
+
+
+# --- Spam list (blacklist) ------------------------------------------------
+# spamnumbers.txt lives in the ARCHIVE folder (next to the .xml / contacts.csv),
+# so it is portable and travels with the archive. Numbers are matched with the
+# same normalization as everything else (country code stripped, etc.), and
+# contacts.csv acts as a whitelist that overrides the spam list.
+SPAM_FILENAME = 'spamnumbers.txt'
+
+
+def _spam_file_path(xml_directory):
+    return os.path.join(xml_directory, SPAM_FILENAME)
+
+
+def load_spam_numbers(xml_directory):
+    """Normalized set of spam numbers from spamnumbers.txt (blank/# lines ignored)."""
+    spam = set()
+    if not xml_directory:
+        return spam
+    path = _spam_file_path(xml_directory)
+    if not os.path.exists(path):
+        return spam
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                n = normalize_number(line)
+                if n:
+                    spam.add(n)
+    except OSError:
+        pass
+    return spam
+
+
+def add_spam_number(xml_directory, number):
+    """Append a normalized number to spamnumbers.txt if not already present."""
+    n = normalize_number(number)
+    if not n or n in load_spam_numbers(xml_directory):
+        return None
+    try:
+        with open(_spam_file_path(xml_directory), 'a', encoding='utf-8') as f:
+            f.write(n + '\n')
+        return n
+    except OSError:
+        return None
+
+
+def remove_spam_number(xml_directory, number):
+    """Remove every line matching `number` (normalized); keep comments/blanks."""
+    target = normalize_number(number)
+    path = _spam_file_path(xml_directory)
+    if not target or not os.path.exists(path):
+        return False
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        kept = [ln for ln in lines if normalize_number(ln.strip()) != target]
+        if len(kept) == len(lines):
+            return False
+        with open(path, 'w', encoding='utf-8') as f:
+            f.writelines(kept)
+        return True
+    except OSError:
+        return False
+
+
+def effective_spam_set(xml_directory, conn):
+    """Spam numbers that are NOT whitelisted by a contacts.csv entry."""
+    spam = load_spam_numbers(xml_directory)
+    if not spam:
+        return set()
+    contacts = {r['address'] for r in conn.execute('SELECT address FROM contact_names')}
+    return {n for n in spam if n not in contacts}
 
 # --- Flask App Initialization ---
 app = Flask(__name__, template_folder='.')
@@ -466,6 +565,9 @@ def process_xml_files():
 
     conn = get_db_connection()
     all_contact_names = load_contacts_from_csv(xml_directory)
+    # Spam numbers (blacklist) minus contacts (whitelist wins). Spam media is
+    # still extracted, but segregated into a flat 'Spam/' folder.
+    effective_spam = {n for n in load_spam_numbers(xml_directory) if n not in all_contact_names}
     total_mms_count, total_media_files_found = 0, 0
     processed_media_hashes = set()
     
@@ -577,10 +679,17 @@ def process_xml_files():
                             media_msg = base_msg_data.copy()
                             
                             sender_name = all_contact_names.get(from_address, from_address)
-                            sender_folder = "Sent" if message_type == '2' else (sender_name or "Unknown Sender")
-                            
                             dt_object = datetime.fromtimestamp(date / 1000.0)
-                            base_filename = dt_object.strftime('%Y-%m-%d %H-%M-%S')
+                            date_name = dt_object.strftime('%Y-%m-%d %H-%M-%S')
+
+                            if from_address in effective_spam:
+                                # All spam media in one flat 'Spam' folder, filename
+                                # prefixed with the spam number for identification.
+                                sender_folder = "Spam"
+                                base_filename = f"{from_address}_{date_name}"
+                            else:
+                                sender_folder = "Sent" if message_type == '2' else (sender_name or "Unknown Sender")
+                                base_filename = date_name
                             extension = part['ct'].split('/')[-1]
                             
                             sender_dir = os.path.join(media_dir, sender_folder)
@@ -633,6 +742,7 @@ def process_xml_files():
     with conn:
         total_messages = conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
         total_mms_media = conn.execute('SELECT COUNT(*) FROM messages WHERE mms_media_path IS NOT NULL').fetchone()[0]
+        drow = conn.execute('SELECT MIN(date), MAX(date) FROM messages').fetchone()
         # Record cache metadata so this cache can be validated/reused next time.
         meta = {
             'format_version': str(CACHE_FORMAT_VERSION),
@@ -640,6 +750,8 @@ def process_xml_files():
             'source_manifest': json.dumps(build_source_manifest(xml_directory)),
             'indexed_at': datetime.now().isoformat(timespec='seconds'),
             'message_count': str(total_messages),
+            'date_min': str(drow[0]) if drow and drow[0] else '',
+            'date_max': str(drow[1]) if drow and drow[1] else '',
         }
         conn.executemany('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)', list(meta.items()))
         app.logger.info(f"\n=== INDEXING COMPLETE ===")
@@ -820,17 +932,66 @@ def prune_caches():
     app.logger.info(f"Pruned {len(removed)} orphaned cache(s), freed {freed} bytes")
     return jsonify({'removed': removed, 'freed_bytes': freed})
 
+@app.route('/api/spam')
+def get_spam():
+    xml_dir = app.config.get('XML_DIRECTORY')
+    if not xml_dir:
+        return jsonify({'error': 'No archive is open.'}), 400
+    spam = sorted(load_spam_numbers(xml_dir))
+    names = {}
+    conn = get_db_connection()
+    if conn is not None:
+        try:
+            names = {r['address']: r['name'] for r in conn.execute('SELECT address, name FROM contact_names')}
+        finally:
+            conn.close()
+    # A spam number that is also a contact is "whitelisted" — shown anyway.
+    items = [{'number': n, 'contact_name': names.get(n), 'whitelisted': n in names} for n in spam]
+    return jsonify({'spam': items, 'file': _spam_file_path(xml_dir)})
+
+@app.route('/api/spam/add', methods=['POST'])
+def add_spam():
+    xml_dir = app.config.get('XML_DIRECTORY')
+    if not xml_dir:
+        return jsonify({'error': 'No archive is open.'}), 400
+    body = request.json or {}
+    added = []
+    if body.get('participants'):
+        # A conversation's participants string is '~'-joined normalized numbers.
+        for part in str(body['participants']).split('~'):
+            if part.strip():
+                n = add_spam_number(xml_dir, part)
+                if n:
+                    added.append(n)
+    elif body.get('number') is not None:
+        # A single number, possibly with spaces/punctuation — normalize as one.
+        n = add_spam_number(xml_dir, str(body['number']))
+        if n:
+            added.append(n)
+    return jsonify({'added': added})
+
+@app.route('/api/spam/remove', methods=['POST'])
+def remove_spam():
+    xml_dir = app.config.get('XML_DIRECTORY')
+    if not xml_dir:
+        return jsonify({'error': 'No archive is open.'}), 400
+    number = (request.json or {}).get('number', '')
+    return jsonify({'removed': remove_spam_number(xml_dir, number)})
+
 @app.route('/api/stats')
 def get_stats():
     conn = get_db_connection()
     if conn is None: return jsonify({'error': 'Could not connect to database.'}), 500
     try:
+        drow = conn.execute('SELECT MIN(date), MAX(date) FROM messages').fetchone()
+        date_min, date_max = (drow[0], drow[1]) if drow else (None, None)
         stats = {
             'total_messages': conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0],
             'total_conversations': conn.execute('SELECT COUNT(DISTINCT participants) FROM messages').fetchone()[0],
             'total_with_names': conn.execute('SELECT COUNT(DISTINCT address) FROM contact_names').fetchone()[0],
             'total_mms_images': conn.execute('SELECT COUNT(*) FROM messages WHERE mms_media_path IS NOT NULL').fetchone()[0],
-            'db_size_mb': round(os.path.getsize(app.config["DB_PATH"]) / (1024*1024), 2)
+            'db_size_mb': round(os.path.getsize(app.config["DB_PATH"]) / (1024*1024), 2),
+            'date_range': f"{_fmt_date(date_min)} to {_fmt_date(date_max)}" if date_min and date_max else '',
         }
         return jsonify(stats)
     except sqlite3.OperationalError:
@@ -878,23 +1039,28 @@ def get_conversations():
     if conn is None: return jsonify({'error': 'Database not available.'}), 500
     
     try:
+        eff_spam = effective_spam_set(app.config.get('XML_DIRECTORY'), conn)
         query = '''
-            SELECT 
-                participants as address, 
-                MAX(date) as last_message_date, 
+            SELECT
+                participants as address,
+                MAX(date) as last_message_date,
                 COUNT(id) as message_count,
                 SUM(CASE WHEN mms_media_path IS NOT NULL THEN 1 ELSE 0 END) as image_count
             FROM messages
-            GROUP BY participants 
+            GROUP BY participants
             ORDER BY last_message_date DESC
         '''
         rows = conn.execute(query).fetchall()
-        
+
         conversations = []
         for row in rows:
             row_dict = dict(row)
             participants_list = row_dict['address'].split('~')
-            
+
+            # Hide conversations whose participants are all spam (contacts override).
+            if eff_spam and all(p in eff_spam for p in participants_list):
+                continue
+
             # Create a string of placeholders for the query, e.g., (?,?,?)
             placeholders = ','.join('?' for _ in participants_list)
             
@@ -971,24 +1137,31 @@ def search_messages():
             GROUP BY participants 
             ORDER BY last_message_date DESC
         '''
+        eff_spam = effective_spam_set(app.config.get('XML_DIRECTORY'), conn)
+
+        def _is_spam(participants_str):
+            parts = (participants_str or '').split('~')
+            return bool(eff_spam) and bool(parts) and all(p in eff_spam for p in parts)
+
         conv_rows = conn.execute(conv_query, (f'%{query_term}%',)).fetchall()
-        conversations = [dict(row) for row in conv_rows]
+        conversations = [dict(row) for row in conv_rows if not _is_spam(row['address'])]
 
         # Search for messages by body content
         msg_query = '''
-            SELECT 
+            SELECT
                 m.id, m.address, m.date, m.type, m.body, m.mms_media_path, m.mms_media_type, m.readable_date,
+                m.participants,
                 COALESCE(c.name, m.address) as contact_name,
                 COALESCE(s.name, m.sender_address) as sender
             FROM messages m
             LEFT JOIN contact_names c ON m.participants = c.address
             LEFT JOIN contact_names s ON m.sender_address = s.address
             WHERE m.body LIKE ?
-            ORDER BY m.date DESC 
+            ORDER BY m.date DESC
             LIMIT 100
         '''
         msg_rows = conn.execute(msg_query, (f'%{query_term}%',)).fetchall()
-        messages = [dict(row) for row in msg_rows]
+        messages = [dict(row) for row in msg_rows if not _is_spam(row['participants'])]
 
         return jsonify({'conversations': conversations, 'messages': messages})
     finally:

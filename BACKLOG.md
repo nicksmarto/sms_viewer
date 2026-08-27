@@ -8,12 +8,10 @@ GitHub, these can graduate into GitHub Issues (one issue per item).
   in `.env`, sample the archive for the most frequently occurring number (a strong
   signal it's the account owner's) and ask the user to confirm it. Falls back to the
   `.env` value / manual entry.
-- **Unified contact/spam filtering (whitelist + blacklist + neither).** Combine three
-  signals elegantly: `contacts.csv` as a *whitelist* (known people), a spam list (like
-  the old `spamnumbers.txt`) as a *blacklist*, and a sensible default for numbers in
-  neither. Historically spam was handled *outside* this app by a separate
-  `delete_folders.py` script — this would bring it in as a first-class, non-destructive
-  view/filter. New design; affects both conversation display and sender-folder naming.
+- **Refine spam/whitelist (future).** Possible follow-ups on the shipped filtering: a
+  bulk-import of an existing spam list, a way to mark spam from the conversation *list*
+  (not just an open conversation), and optionally excluding the `Spam/` folder from media
+  export.
 
 - **Write EXIF capture time into media.** Today the app only sets each extracted media
   file's *filesystem* date to the message time; it does not write the date into the image's
@@ -42,6 +40,10 @@ GitHub, these can graduate into GitHub Issues (one issue per item).
 - ✅ **Cache management** — a "Manage cached indexes" panel to list every cache (source,
   size, message count, date), delete individual ones, and clear caches whose source folder
   is gone; guarded against path traversal.
+- ✅ **Contacts whitelist + spam blacklist** — `contacts.csv` names/whitelist plus a portable
+  `spamnumbers.txt`; one-click "Mark as spam" (instant, query-time), a "Manage spam numbers"
+  panel, contacts always override spam, spam media segregated into a flat `Spam/` folder.
+- ✅ **Date range covered** — shown on the main stats panel and in the cache-management panel.
 - ✅ SQLite robustness (WAL mode + busy timeout).
 - ✅ Richer indexing progress in the UI (phase, file x/N, live message/media counts, date range).
 - ✅ On-demand **Export media to folder** button (writes the browsable, sender-organized
