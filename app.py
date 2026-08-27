@@ -70,6 +70,66 @@ def build_source_manifest(source_dir):
         pass
     return manifest
 
+
+# --- Cache management -----------------------------------------------------
+def _dir_size_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _read_cache_meta(db_path):
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        meta = {r['key']: r['value'] for r in conn.execute('SELECT key, value FROM cache_meta')}
+        conn.close()
+        return meta
+    except sqlite3.Error:
+        return {}
+
+
+def _cache_dir_for_hash(cache_hash):
+    """Resolve a cache hash to its directory, guarding against path traversal."""
+    root = os.path.abspath(get_cache_root())
+    cdir = os.path.abspath(os.path.join(root, cache_hash or ''))
+    if os.path.dirname(cdir) != root or not os.path.isdir(cdir):
+        return None
+    return cdir
+
+
+def list_caches():
+    """Every cache under the cache root, with size and whether its source
+    folder still exists."""
+    root = get_cache_root()
+    caches = []
+    if not os.path.isdir(root):
+        return caches
+    current_db = app.config.get('DB_PATH')
+    current_dir = os.path.dirname(current_db) if current_db else None
+    for name in sorted(os.listdir(root)):
+        cdir = os.path.join(root, name)
+        db_path = os.path.join(cdir, DB_NAME)
+        if not os.path.isdir(cdir) or not os.path.exists(db_path):
+            continue
+        meta = _read_cache_meta(db_path)
+        src = meta.get('source_dir', '')
+        caches.append({
+            'hash': name,
+            'source_dir': src,
+            'source_exists': bool(src) and os.path.isdir(src),
+            'indexed_at': meta.get('indexed_at', ''),
+            'message_count': meta.get('message_count', ''),
+            'size_bytes': _dir_size_bytes(cdir),
+            'is_current': bool(current_dir) and os.path.abspath(cdir) == os.path.abspath(current_dir),
+        })
+    return caches
+
 # --- Flask App Initialization ---
 app = Flask(__name__, template_folder='.')
 logging.basicConfig(level=logging.INFO)
@@ -719,6 +779,46 @@ def start_indexing():
 @app.route('/api/indexing-status')
 def get_indexing_status():
     return jsonify(indexing_status)
+
+@app.route('/api/caches')
+def get_caches():
+    caches = list_caches()
+    return jsonify({
+        'cache_root': get_cache_root(),
+        'total_size_bytes': sum(c['size_bytes'] for c in caches),
+        'caches': caches,
+    })
+
+@app.route('/api/caches/delete', methods=['POST'])
+def delete_cache():
+    cache_hash = (request.json or {}).get('hash', '')
+    cdir = _cache_dir_for_hash(cache_hash)
+    if not cdir:
+        return jsonify({'error': 'Unknown cache.'}), 400
+    freed = _dir_size_bytes(cdir)
+    try:
+        shutil.rmtree(cdir)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    app.logger.info(f"Deleted cache {cache_hash} (freed {freed} bytes)")
+    return jsonify({'removed': cache_hash, 'freed_bytes': freed})
+
+@app.route('/api/caches/prune', methods=['POST'])
+def prune_caches():
+    """Delete caches whose source folder no longer exists (self-healing)."""
+    removed, freed = [], 0
+    for c in list_caches():
+        if not c['source_exists']:
+            cdir = _cache_dir_for_hash(c['hash'])
+            if cdir:
+                try:
+                    shutil.rmtree(cdir)
+                    removed.append(c['hash'])
+                    freed += c['size_bytes']
+                except OSError:
+                    pass
+    app.logger.info(f"Pruned {len(removed)} orphaned cache(s), freed {freed} bytes")
+    return jsonify({'removed': removed, 'freed_bytes': freed})
 
 @app.route('/api/stats')
 def get_stats():
