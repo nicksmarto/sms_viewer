@@ -15,6 +15,11 @@ GitHub, these can graduate into GitHub Issues (one issue per item).
   `delete_folders.py` script — this would bring it in as a first-class, non-destructive
   view/filter. New design; affects both conversation display and sender-folder naming.
 
+- **Write EXIF capture time into media.** Today the app only sets each extracted media
+  file's *filesystem* date to the message time; it does not write the date into the image's
+  own EXIF metadata (an original goal). Add this (e.g. via `piexif`, which is why it was
+  once a dependency), preserving any real camera EXIF already present.
+
 ## Architecture / hygiene
 - **Make assumptions configurable.** The UTC-6 timezone assumption and DB filename are
   baked in; expose them as config where it makes sense.

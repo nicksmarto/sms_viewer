@@ -1,4 +1,3 @@
 Flask
 lxml
-piexif
 python-dotenv

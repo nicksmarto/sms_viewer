@@ -22,7 +22,7 @@ ever uploaded. It's a Flask app you run locally that opens in your web browser.
 - **Full-text search** — search across every message, and filter conversations by contact name.
 - **Contact-name resolution** — turns phone numbers into names using the backup data plus an optional `contacts.csv`.
 - **Group-chat support** — correctly identifies group conversations and their participants.
-- **Media deduplication & EXIF handling** — skips duplicate images (common across overlapping backups) and preserves capture timestamps.
+- **Media deduplication** — skips duplicate images (common across overlapping backups) by content hash, and sets each extracted file's date to when the message was received.
 - **Robust parsing** — skips corrupted/malformed entries instead of failing the whole file.
 
 ---
@@ -116,28 +116,32 @@ Your browser opens automatically at **http://127.0.0.1:5000** (if not, open that
 
 **2. Point it at your backups**
 
-In the app, enter the **full path to the folder** that contains your `.xml` files
-(and optional `contacts.csv`), then start indexing.
+Click **Browse…** to choose the folder that contains your `.xml` files (and optional
+`contacts.csv`) in a native folder picker — or paste the path — then load it.
 
-- **First run:** the app parses the XML, builds a search index, and extracts MMS media.
-- **Later runs:** it reuses the existing index instantly. There's a **rebuild** option if
-  you add new backups.
+- **First run:** the app parses the XML, builds the search index, and extracts MMS media
+  (with a live progress readout).
+- **Later runs:** it reuses the existing cache instantly. If your backup files have changed
+  it offers to rebuild, and there's always a manual **Rebuild Index** button.
 
 **3. Browse and search**
 
 Pick a conversation on the left; read and search messages on the right. MMS images and
 videos appear inline.
 
-### What gets created, and where
+### Where your data and the cache live
 
-The app writes two things **inside the folder you point it at**:
+The app **never writes into your backup folder.** It reads your `.xml` files (and an
+optional `contacts.csv`) and writes everything it generates — the SQLite search index and
+the extracted MMS media — into a **local cache** outside your archive, at
+`~/Library/Application Support/SMSViewer/<per-archive>/` on macOS.
 
-| Item | What it is |
-|------|-----------|
-| `sms_messages.db` | The local SQLite search index |
-| `mms_media/` | Extracted MMS attachments, organized by sender |
+This is deliberate: it keeps your backups untouched and avoids database errors on
+cloud-synced folders (e.g. Google Drive), where SQLite can't run reliably. The cache is
+disposable — delete it, or click **Rebuild Index**, and it regenerates from your XML.
 
-Both are regenerated from your XML and can be safely deleted (a rebuild recreates them).
+For a browsable, sender-organized copy of your media saved *into* your archive folder, use
+the **Export media to folder** button in the app.
 
 ---
 
@@ -157,6 +161,9 @@ A small **Flask** backend parses the XML with **lxml**, normalizes and de-duplic
 messages into **SQLite**, extracts MMS parts to disk, and resolves phone numbers to names.
 The frontend is a single **HTML + Tailwind CSS + vanilla JavaScript** page that talks to a
 small JSON API. See `app.py` for the backend and `index.html` for the UI.
+
+For *why* the tool is built the way it is — the design principles, key decisions, and
+assumptions — see **[DESIGN.md](DESIGN.md)**.
 
 ## Development
 
