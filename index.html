@@ -363,7 +363,9 @@
                         render.messages(messages, conversationName);
                         G.state.currentAddress = conversationId;
                         G.state.currentName = conversationName;
-                        G.els.markSpamBtn.classList.remove('hidden');
+                        // Only offer "Mark as spam" for 1:1 conversations — marking a group
+                        // would blacklist every participant (and hide 1:1 chats with them).
+                        G.els.markSpamBtn.classList.toggle('hidden', String(conversationId).includes('~'));
                     } catch (error) {
                         console.error('Failed to load messages:', error);
                     }
