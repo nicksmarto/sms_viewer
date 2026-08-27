@@ -14,6 +14,7 @@ import time
 from io import StringIO
 import logging
 import sys
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -608,6 +609,48 @@ def run_indexing():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/api/browse-folder', methods=['POST'])
+def browse_folder():
+    """Open a NATIVE folder chooser on the machine running the server (this is a
+    local app, so that's the user's own computer) and return the chosen path.
+    Returns {'path': ''} if the user cancels."""
+    start = (request.json or {}).get('start') or os.path.expanduser('~')
+    if not os.path.isdir(start):
+        start = os.path.expanduser('~')
+    try:
+        if sys.platform == 'darwin':
+            # AppleScript: reliable, no extra dependencies. `default location`
+            # seeds the dialog at the current path if there is one.
+            script = (
+                'set startFolder to POSIX file "%s" as alias\n'
+                'POSIX path of (choose folder with prompt '
+                '"Select your SMS backup folder" default location startFolder)'
+                % start.replace('"', '\\"')
+            )
+            r = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+            # Non-zero return code is normal when the user clicks Cancel.
+            path = r.stdout.strip() if r.returncode == 0 else ''
+        elif os.name == 'nt':
+            ps = (
+                'Add-Type -AssemblyName System.Windows.Forms;'
+                '$d = New-Object System.Windows.Forms.FolderBrowserDialog;'
+                'if ($d.ShowDialog() -eq "OK") { Write-Output $d.SelectedPath }'
+            )
+            r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                               capture_output=True, text=True)
+            path = r.stdout.strip() if r.returncode == 0 else ''
+        else:
+            # Linux/other: fall back to a Tk dialog if available.
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+            path = filedialog.askdirectory(initialdir=start) or ''
+            root.destroy()
+        return jsonify({'path': path.rstrip('/') if path else ''})
+    except Exception as e:
+        app.logger.error(f"Folder picker failed: {e}")
+        return jsonify({'error': 'The folder picker is unavailable; paste a path instead.'}), 500
 
 @app.route('/api/set-directory', methods=['POST'])
 def set_directory():

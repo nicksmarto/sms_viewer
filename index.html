@@ -23,9 +23,12 @@
         <div id="modal-container" class="fixed inset-0 bg-gray-900 bg-opacity-80 flex items-center justify-center z-50">
             <div class="bg-gray-800 p-8 rounded-lg shadow-2xl max-w-lg w-full">
                 <h2 class="text-2xl font-bold mb-4 text-white">Welcome to SMS Backup Viewer</h2>
-                <p class="mb-6 text-gray-400">Please provide the absolute path to the directory containing your <code class="bg-gray-700 text-emerald-400 px-1 rounded">.xml</code> backup files.</p>
-                <input type="text" id="dir-path-input" placeholder="e.g., /Users/yourname/Documents/SMSBackups" class="w-full bg-gray-900 border border-gray-700 text-white rounded-md px-4 py-2 mb-4 focus:ring-2 focus:ring-blue-500 focus:outline-none">
-                <button id="submit-dir-path" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors">Set Directory & Load</button>
+                <p class="mb-6 text-gray-400">Choose the folder that contains your <code class="bg-gray-700 text-emerald-400 px-1 rounded">.xml</code> backup files — click <strong>Browse…</strong>, or paste the path.</p>
+                <div class="flex gap-2 mb-4">
+                    <input type="text" id="dir-path-input" placeholder="Pick a folder, or paste a path…" class="flex-grow min-w-0 bg-gray-900 border border-gray-700 text-white rounded-md px-4 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    <button id="browse-folder-btn" class="flex-shrink-0 bg-gray-700 hover:bg-gray-600 text-white font-semibold px-4 rounded-md transition-colors">Browse…</button>
+                </div>
+                <button id="submit-dir-path" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors">Set Directory &amp; Load</button>
                 <div id="modal-error" class="text-red-400 mt-4 text-sm hidden"></div>
             </div>
         </div>
@@ -98,6 +101,7 @@
                     mainUI: document.getElementById('main-ui'),
                     dirPathInput: document.getElementById('dir-path-input'),
                     submitDirPathBtn: document.getElementById('submit-dir-path'),
+                    browseFolderBtn: document.getElementById('browse-folder-btn'),
                     modalError: document.getElementById('modal-error'),
                     conversationList: document.getElementById('conversation-list'),
                     messageList: document.getElementById('message-list'),
@@ -461,6 +465,27 @@
             });
 
             G.els.exportMediaBtn.addEventListener('click', actions.exportMedia);
+
+            G.els.browseFolderBtn.addEventListener('click', async () => {
+                const btn = G.els.browseFolderBtn;
+                const original = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = 'Opening…';
+                try {
+                    const start = G.els.dirPathInput.value.trim();
+                    const r = await api.post('/api/browse-folder', { start });
+                    if (r.path) {
+                        G.els.dirPathInput.value = r.path;
+                        G.els.modalError.classList.add('hidden');
+                    }
+                } catch (e) {
+                    G.els.modalError.textContent = `Could not open the folder picker: ${e.message}. You can paste a path instead.`;
+                    G.els.modalError.classList.remove('hidden');
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = original;
+                }
+            });
             
             G.els.searchInput.addEventListener('keyup', () => {
                 clearTimeout(G.state.searchTimeout);
