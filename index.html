@@ -44,7 +44,7 @@
                 <header class="p-4 border-b border-gray-700 flex-shrink-0">
                     <h1 class="text-xl font-bold">Conversations</h1>
                     <div class="mt-2 relative">
-                        <input type="search" id="search-input" placeholder="Search all messages..." class="w-full bg-gray-900 text-sm rounded-md pl-8 pr-2 py-1.5 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                        <input type="search" id="search-input" placeholder="Search messages & contacts..." class="w-full bg-gray-900 text-sm rounded-md pl-8 pr-2 py-1.5 focus:ring-2 focus:ring-blue-500 focus:outline-none">
                         <svg class="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
                     </div>
                 </header>
@@ -90,32 +90,35 @@
 
     <script>
         document.addEventListener('DOMContentLoaded', () => {
-            // DOM elements
-            const modalContainer = document.getElementById('modal-container');
-            const mainUI = document.getElementById('main-ui');
-            const dirPathInput = document.getElementById('dir-path-input');
-            const submitDirPathBtn = document.getElementById('submit-dir-path');
-            const modalError = document.getElementById('modal-error');
-            const conversationList = document.getElementById('conversation-list');
-            const messageList = document.getElementById('message-list');
-            const placeholder = document.getElementById('placeholder');
-            const currentContact = document.getElementById('current-contact');
-            const currentNumber = document.getElementById('current-number');
-            const statsPanel = document.getElementById('stats-panel');
-            const rebuildIndexBtn = document.getElementById('rebuild-index-btn');
-            const searchInput = document.getElementById('search-input');
-            const imageModal = document.getElementById('image-modal');
-            const modalImage = document.getElementById('modal-image');
-            const closeImageModal = document.getElementById('close-image-modal');
-            
-            const indexingOverlay = document.getElementById('indexing-overlay');
-            const indexingProgressBar = document.getElementById('indexing-progress-bar');
-            const indexingProgressText = document.getElementById('indexing-progress-text');
-            const indexingFileText = document.getElementById('indexing-file-text');
+            const G = { // Global state and DOM elements
+                els: {
+                    modalContainer: document.getElementById('modal-container'),
+                    mainUI: document.getElementById('main-ui'),
+                    dirPathInput: document.getElementById('dir-path-input'),
+                    submitDirPathBtn: document.getElementById('submit-dir-path'),
+                    modalError: document.getElementById('modal-error'),
+                    conversationList: document.getElementById('conversation-list'),
+                    messageList: document.getElementById('message-list'),
+                    placeholder: document.getElementById('placeholder'),
+                    currentContact: document.getElementById('current-contact'),
+                    currentNumber: document.getElementById('current-number'),
+                    statsPanel: document.getElementById('stats-panel'),
+                    rebuildIndexBtn: document.getElementById('rebuild-index-btn'),
+                    searchInput: document.getElementById('search-input'),
+                    imageModal: document.getElementById('image-modal'),
+                    modalImage: document.getElementById('modal-image'),
+                    closeImageModal: document.getElementById('close-image-modal'),
+                    indexingOverlay: document.getElementById('indexing-overlay'),
+                    indexingProgressBar: document.getElementById('indexing-progress-bar'),
+                    indexingProgressText: document.getElementById('indexing-progress-text'),
+                    indexingFileText: document.getElementById('indexing-file-text'),
+                },
+                state: {
+                    searchTimeout: null,
+                    isSearching: false,
+                }
+            };
 
-            let searchTimeout;
-
-            // --- API Helper ---
             const api = {
                 async post(endpoint, body) {
                     const response = await fetch(endpoint, {
@@ -123,11 +126,11 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(body),
                     });
+                    const responseBody = await response.json();
                     if (!response.ok) {
-                        const error = await response.json();
-                        throw new Error(error.description || 'An unknown error occurred');
+                        throw new Error(responseBody.error || 'An unknown error occurred');
                     }
-                    return response.json();
+                    return responseBody;
                 },
                 async get(endpoint) {
                     const response = await fetch(endpoint);
@@ -136,316 +139,299 @@
                 }
             };
 
-            // --- Image Modal Functions ---
-            const showImageModal = (url) => {
-                modalImage.src = url;
-                imageModal.classList.remove('hidden');
-            };
-
-            const hideImageModal = () => {
-                imageModal.classList.add('hidden');
-                modalImage.src = '';
-            };
-
-            // --- Utility Functions ---
-            const escapeHtml = (text) => {
-                if (text === null || text === undefined) return '';
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            };
-
-            // --- UI Rendering Functions ---
-            const renderConversations = (conversations) => {
-                conversationList.innerHTML = '';
-                if (!conversations || conversations.length === 0) {
-                    conversationList.innerHTML = `<p class="p-4 text-sm text-gray-500">No conversations found.</p>`;
-                    return;
+            const utils = {
+                escapeHtml: (text) => {
+                    if (text === null || text === undefined) return '';
+                    const div = document.createElement('div');
+                    div.textContent = text;
+                    return div.innerHTML;
+                },
+                showImageModal: (url) => {
+                    G.els.modalImage.src = url;
+                    G.els.imageModal.classList.remove('hidden');
+                },
+                hideImageModal: () => {
+                    G.els.imageModal.classList.add('hidden');
+                    G.els.modalImage.src = '';
+                },
+                showIndexingOverlay: (show) => {
+                    G.els.indexingOverlay.style.display = show ? 'flex' : 'none';
                 }
-                
-                conversations.forEach(conv => {
-                    const item = document.createElement('div');
-                    item.className = 'conversation-item p-4 border-b border-gray-700 cursor-pointer hover:bg-gray-700/50 transition-colors';
-                    item.dataset.address = conv.address;
+            };
+            
+            window.showImageModal = utils.showImageModal;
+
+            const render = {
+                conversations: (conversations) => {
+                    G.els.conversationList.innerHTML = '';
+                    if (!conversations || conversations.length === 0) {
+                        G.els.conversationList.innerHTML = `<p class="p-4 text-sm text-gray-500">No conversations found.</p>`;
+                        return;
+                    }
                     
-                    const imageIndicator = conv.image_count > 0 ? `📷 ` : '';
-                    const nameDisplay = conv.contact_name || conv.address;
-                    
-                    item.innerHTML = `
-                        <div class="font-bold truncate">${imageIndicator}${escapeHtml(nameDisplay)}</div>
-                        <div class="text-xs text-gray-400">${conv.address} (${conv.message_count}${conv.image_count > 0 ? `, ${conv.image_count} media` : ''})</div>
-                        <div class="text-xs text-gray-500 mt-1">${new Date(conv.last_message_date).toLocaleString()}</div>
-                    `;
-                    
-                    item.addEventListener('click', () => {
-                        document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
-                        item.classList.add('active');
-                        loadMessages(conv.address, nameDisplay);
+                    conversations.forEach(conv => {
+                        const item = document.createElement('div');
+                        item.className = 'conversation-item p-4 border-b border-gray-700 cursor-pointer hover:bg-gray-700/50 transition-colors';
+                        item.dataset.conversationId = conv.address;
+                        
+                        const imageIndicator = conv.image_count > 0 ? `📷 ` : '';
+                        const nameDisplay = conv.contact_name;
+                        
+                        item.innerHTML = `
+                            <div class="font-bold truncate">${imageIndicator}${utils.escapeHtml(nameDisplay)}</div>
+                            <div class="text-xs text-gray-400">${conv.message_count} messages${conv.image_count > 0 ? `, ${conv.image_count} media` : ''}</div>
+                            <div class="text-xs text-gray-500 mt-1">${new Date(conv.last_message_date).toLocaleString()}</div>
+                        `;
+                        
+                        item.addEventListener('click', () => {
+                            document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
+                            item.classList.add('active');
+                            actions.loadMessages(conv.address, nameDisplay);
+                        });
+                        
+                        G.els.conversationList.appendChild(item);
+                    });
+                },
+                messages: (messages, conversationName) => {
+                    G.els.messageList.innerHTML = '';
+                    G.els.placeholder.classList.add('hidden');
+                    G.els.currentContact.textContent = conversationName;
+                    G.els.currentNumber.textContent = ''; // No longer showing a single number
+
+                    if (!messages || messages.length === 0) return;
+
+                    messages.forEach(msg => {
+                        const isSent = msg.type === 2;
+                        const wrapper = document.createElement('div');
+                        wrapper.className = `flex ${isSent ? 'justify-end' : 'justify-start'}`;
+                        wrapper.dataset.date = msg.date;
+                        
+                        const bubble = document.createElement('div');
+                        bubble.className = `max-w-md lg:max-w-xl p-3 rounded-lg shadow ${isSent ? 'bg-blue-600' : 'bg-gray-700'}`;
+
+                        let senderHtml = '';
+                        if (!isSent && msg.sender && msg.sender !== 'self') {
+                            senderHtml = `<div class="text-xs font-bold mb-1 text-indigo-300">${utils.escapeHtml(msg.sender)}</div>`;
+                        }
+
+                        let contentHtml = '';
+                        if (msg.mms_media_path) {
+                            const mediaUrl = `/api/media/${msg.mms_media_path}`;
+                            if (msg.mms_media_type.startsWith('image/')) {
+                                contentHtml += `<div class="mb-2"><img src="${mediaUrl}" class="max-w-xs md:max-w-sm rounded-lg border border-gray-600 cursor-pointer" onclick="showImageModal('${mediaUrl}')"></div>`;
+                            } else if (msg.mms_media_type.startsWith('video/')) {
+                                contentHtml += `<div class="mb-2"><video controls class="max-w-xs md:max-w-sm rounded-lg border border-gray-600"><source src="${mediaUrl}" type="${msg.mms_media_type}"></video></div>`;
+                            } else if (msg.mms_media_type.startsWith('audio/')) {
+                                contentHtml += `<div class="my-2"><audio controls src="${mediaUrl}" class="w-full"></audio></div>`;
+                            }
+                        }
+                        
+                        if (msg.body && msg.body.trim()) {
+                            contentHtml += `<p class="text-sm">${utils.escapeHtml(msg.body)}</p>`;
+                        }
+                        
+                        if (!contentHtml.trim()) contentHtml = `<p class="text-sm text-gray-400 italic">[Empty message]</p>`;
+                        
+                        bubble.innerHTML = `${senderHtml}${contentHtml}<div class="text-xs mt-2 text-right ${isSent ? 'text-blue-200' : 'text-gray-400'}">${msg.readable_date}</div>`;
+                        
+                        wrapper.appendChild(bubble);
+                        G.els.messageList.appendChild(wrapper);
                     });
                     
-                    conversationList.appendChild(item);
-                });
-            };
-
-            const renderMessages = (messages, contactName, address) => {
-                messageList.innerHTML = '';
-                placeholder.classList.add('hidden');
-                currentContact.textContent = contactName;
-                currentNumber.textContent = address;
-
-                if (!messages || messages.length === 0) return;
-
-                messages.forEach(msg => {
-                    const isSent = msg.type === 2;
-                    const wrapper = document.createElement('div');
-                    wrapper.className = `flex ${isSent ? 'justify-end' : 'justify-start'}`;
-                    wrapper.dataset.date = msg.date;
+                    setTimeout(() => { G.els.messageList.scrollTop = G.els.messageList.scrollHeight; }, 0);
+                },
+                searchResults: (results) => {
+                    G.els.messageList.innerHTML = '';
+                    G.els.placeholder.classList.add('hidden');
+                    G.els.currentContact.textContent = `Search Results for "${G.els.searchInput.value}"`;
+                    G.els.currentNumber.textContent = `${results.length} matches found`;
                     
-                    const bubble = document.createElement('div');
-                    bubble.className = `max-w-md lg:max-w-xl p-3 rounded-lg shadow`;
-                    bubble.classList.add(isSent ? 'bg-blue-600' : 'bg-gray-700');
-
-                    let senderHtml = '';
-                    if (address.includes('~') && !isSent && msg.sender) {
-                        senderHtml = `<div class="text-xs font-bold mb-1 text-gray-400">${escapeHtml(msg.sender)}</div>`;
+                    if (results.length === 0) {
+                        G.els.messageList.innerHTML = `<div class="text-center text-gray-500">No results found.</div>`;
+                        return;
                     }
 
-                    let contentHtml = '';
-                    
-                    if (msg.mms_media_path) {
-                        const mediaUrl = `/api/media/${msg.mms_media_path}`;
-                        if (msg.mms_media_type.startsWith('image/')) {
-                            contentHtml += `<div class="mb-2"><img src="${mediaUrl}" class="max-w-xs md:max-w-sm rounded-lg border border-gray-600 cursor-pointer" onclick="showImageModal('${mediaUrl}')"></div>`;
-                        } else if (msg.mms_media_type.startsWith('video/')) {
-                            contentHtml += `<div class="mb-2"><video controls class="max-w-xs md:max-w-sm rounded-lg border border-gray-600"><source src="${mediaUrl}" type="${msg.mms_media_type}"></video></div>`;
-                        } else if (msg.mms_media_type.startsWith('audio/')) {
-                            contentHtml += `<div class="my-2"><audio controls src="${mediaUrl}" class="w-full"></audio></div>`;
+                    results.forEach(msg => {
+                        const item = document.createElement('div');
+                        item.className = `p-3 rounded-lg shadow border border-gray-700 bg-gray-800 cursor-pointer hover:bg-gray-700/50 transition-colors`;
+                        item.addEventListener('click', () => actions.jumpToMessage(msg.participants, msg.date, msg.contact_name));
+                        
+                        let contentHtml = '';
+                        if (msg.mms_media_path && msg.mms_media_type.startsWith('image/')) {
+                            contentHtml += `<div class="mb-2"><img src="/api/media/${msg.mms_media_path}" class="max-w-xs rounded-lg border border-gray-600"></div>`;
                         }
-                    }
-                    
-                    if (msg.body && msg.body.trim()) {
-                        contentHtml += `<p class="text-sm">${escapeHtml(msg.body)}</p>`;
-                    }
-                    
-                    if (!contentHtml.trim()) {
-                        contentHtml = `<p class="text-sm text-gray-400 italic">[Empty message]</p>`;
-                    }
-                    
-                    bubble.innerHTML = `${senderHtml}${contentHtml}<div class="text-xs mt-2 text-right ${isSent ? 'text-blue-200' : 'text-gray-400'}">${msg.readable_date}</div>`;
-                    
-                    wrapper.appendChild(bubble);
-                    messageList.appendChild(wrapper);
-                });
-                
-                setTimeout(() => { messageList.scrollTop = messageList.scrollHeight; }, 0);
-            };
-            
-            const renderSearchResults = (results) => {
-                messageList.innerHTML = '';
-                placeholder.classList.add('hidden');
-                currentContact.textContent = `Search Results for "${searchInput.value}"`;
-                currentNumber.textContent = `${results.length} matches found`;
-                
-                if (results.length === 0) {
-                    messageList.innerHTML = `<div class="text-center text-gray-500">No results found.</div>`;
-                    return;
-                }
-
-                results.forEach(msg => {
-                    const item = document.createElement('div');
-                    item.className = `p-3 rounded-lg shadow border border-gray-700 bg-gray-800 cursor-pointer hover:bg-gray-700/50 transition-colors`;
-                    item.addEventListener('click', () => jumpToMessage(msg.address, msg.date, msg.contact_name));
-                    
-                    let contentHtml = '';
-                    if (msg.mms_media_path && msg.mms_media_type.startsWith('image/')) {
-                        contentHtml += `<div class="mb-2"><img src="/api/media/${msg.mms_media_path}" class="max-w-xs rounded-lg border border-gray-600"></div>`;
-                    }
-                    if (msg.body && msg.body.trim()) {
-                        contentHtml += `<p class="text-sm text-gray-300">${escapeHtml(msg.body)}</p>`;
-                    }
-                    
-                    item.innerHTML = `
-                        <div class="flex justify-between items-baseline mb-2">
-                           <div class="font-bold text-sm">${escapeHtml(msg.contact_name)}</div>
-                           <div class="text-xs text-gray-400">${msg.readable_date}</div>
-                        </div>
-                        ${contentHtml}
-                    `;
-                    messageList.appendChild(item);
-                });
-            };
-
-            const jumpToMessage = async (address, date, contactName) => {
-                document.querySelectorAll('.conversation-item').forEach(el => {
-                    el.classList.toggle('active', el.dataset.address === address);
-                });
-                await loadMessages(address, contactName);
-                setTimeout(() => {
-                    const messageToHighlight = messageList.querySelector(`[data-date="${date}"]`);
-                    if (messageToHighlight) {
-                        messageToHighlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        const bubble = messageToHighlight.querySelector('.max-w-md');
-                        if (bubble) {
-                            bubble.classList.add('ring-2', 'ring-yellow-400');
-                            setTimeout(() => { bubble.classList.remove('ring-2', 'ring-yellow-400'); }, 2500);
+                        if (msg.body && msg.body.trim()) {
+                            contentHtml += `<p class="text-sm text-gray-300">${utils.escapeHtml(msg.body)}</p>`;
                         }
-                    }
-                }, 100);
-            };
-
-            const updateStats = async () => {
-                try {
-                    const stats = await api.get('/api/stats');
-                    statsPanel.innerHTML = `
-                        <div>Messages: <strong class="text-white">${stats.total_messages.toLocaleString()}</strong></div>
-                        <div>Conversations: <strong class="text-white">${stats.total_conversations.toLocaleString()}</strong> (${stats.total_with_names} with names)</div>
-                        <div>MMS Media: <strong class="text-white">${stats.total_mms_images.toLocaleString()}</strong></div>
-                        <div>DB Size: <strong class="text-white">${stats.db_size_mb} MB</strong></div>
-                    `;
-                } catch (e) {
-                    statsPanel.innerHTML = `<p class="text-red-400">Could not load stats.</p>`;
+                        
+                        item.innerHTML = `
+                            <div class="flex justify-between items-baseline mb-2">
+                               <div class="font-bold text-sm">${utils.escapeHtml(msg.contact_name)}</div>
+                               <div class="text-xs text-gray-400">${msg.readable_date}</div>
+                            </div>
+                            ${contentHtml}
+                        `;
+                        G.els.messageList.appendChild(item);
+                    });
                 }
             };
-            
-            const showIndexingOverlay = (show) => {
-                indexingOverlay.style.display = show ? 'flex' : 'none';
-            };
 
-            const pollIndexingStatus = () => {
-                rebuildIndexBtn.disabled = true;
-                rebuildIndexBtn.classList.add('opacity-50', 'cursor-not-allowed');
-                const interval = setInterval(async () => {
+            const actions = {
+                loadInitialData: async () => {
                     try {
-                        const status = await api.get('/api/indexing-status');
-                        if (!status.running) {
-                            clearInterval(interval);
-                            showIndexingOverlay(false);
-                            loadInitialData();
-                            rebuildIndexBtn.disabled = false;
-                            rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                        } else {
-                            const percent = status.total > 0 ? Math.round((status.progress / status.total) * 100) : 0;
-                            indexingProgressBar.style.width = `${percent}%`;
-                            indexingProgressText.textContent = `File ${status.progress} of ${status.total} (${percent}%)`;
-                            indexingFileText.textContent = status.current_file || 'Processing...';
-                        }
+                        const conversations = await api.get('/api/conversations');
+                        render.conversations(conversations);
+                        await actions.updateStats();
+                    } catch (error) {
+                        console.error('Failed to load initial data:', error);
+                    }
+                },
+                loadMessages: async (conversationId, conversationName) => {
+                    try {
+                        const messages = await api.get(`/api/messages/${conversationId}`);
+                        render.messages(messages, conversationName);
+                    } catch (error) {
+                        console.error('Failed to load messages:', error);
+                    }
+                },
+                updateStats: async () => {
+                    try {
+                        const stats = await api.get('/api/stats');
+                        G.els.statsPanel.innerHTML = `
+                            <div>Messages: <strong class="text-white">${stats.total_messages.toLocaleString()}</strong></div>
+                            <div>Conversations: <strong class="text-white">${stats.total_conversations.toLocaleString()}</strong> (${stats.total_with_names} contacts)</div>
+                            <div>MMS Media: <strong class="text-white">${stats.total_mms_images.toLocaleString()}</strong></div>
+                            <div>DB Size: <strong class="text-white">${stats.db_size_mb} MB</strong></div>
+                        `;
                     } catch (e) {
-                        clearInterval(interval);
-                        showIndexingOverlay(false);
-                        alert("An error occurred during indexing. Please check the console and try again.");
-                        rebuildIndexBtn.disabled = false;
-                        rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                        G.els.statsPanel.innerHTML = `<p class="text-red-400">Could not load stats.</p>`;
                     }
-                }, 500);
-            };
-
-            const startIndexing = async (rebuild = false) => {
-                try {
-                    await api.post('/api/start-indexing', { rebuild });
-                    showIndexingOverlay(true);
-                    pollIndexingStatus();
-                } catch (e) {
-                    alert(`Error starting indexing: ${e.message}`);
-                }
-            };
-
-            const loadInitialData = async () => {
-                try {
-                    const conversations = await api.get('/api/conversations');
-                    renderConversations(conversations);
-                    await updateStats();
-                } catch (error) {
-                    console.error('Failed to load initial data:', error);
-                }
-            };
-
-            const loadMessages = async (address, contactName) => {
-                try {
-                    const messages = await api.get(`/api/messages/${encodeURIComponent(address)}`);
-                    renderMessages(messages, contactName, address);
-                } catch (error) {
-                    console.error('Failed to load messages:', error);
-                }
-            };
-            
-            const handleSearch = async () => {
-                const query = searchInput.value.trim();
-                if (query.length < 3) {
-                    if (document.querySelector('.conversation-item.active')) {
-                        const activeConv = document.querySelector('.conversation-item.active');
-                        loadMessages(activeConv.dataset.address, activeConv.querySelector('.font-bold').textContent);
-                    } else {
-                        messageList.innerHTML = '';
-                        placeholder.classList.remove('hidden');
-                        currentContact.textContent = 'Select a conversation';
-                        currentNumber.textContent = '';
+                },
+                startIndexing: async (rebuild = false) => {
+                    try {
+                        await api.post('/api/start-indexing', { rebuild });
+                        utils.showIndexingOverlay(true);
+                        actions.pollIndexingStatus();
+                    } catch (e) {
+                        alert(`Error starting indexing: ${e.message}`);
                     }
-                    return;
-                }
-                
-                try {
-                    const results = await api.get(`/api/search?q=${encodeURIComponent(query)}`);
-                    renderSearchResults(results);
-                } catch (error) {
-                    console.error('Search failed:', error);
-                    messageList.innerHTML = `<div class="text-center text-red-400">Search failed.</div>`;
-                }
-            };
+                },
+                pollIndexingStatus: () => {
+                    G.els.rebuildIndexBtn.disabled = true;
+                    G.els.rebuildIndexBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                    const interval = setInterval(async () => {
+                        try {
+                            const status = await api.get('/api/indexing-status');
+                            if (!status.running) {
+                                clearInterval(interval);
+                                utils.showIndexingOverlay(false);
+                                actions.loadInitialData();
+                                G.els.rebuildIndexBtn.disabled = false;
+                                G.els.rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                            } else {
+                                const percent = status.total > 0 ? Math.round((status.progress / status.total) * 100) : 0;
+                                G.els.indexingProgressBar.style.width = `${percent}%`;
+                                G.els.indexingProgressText.textContent = `File ${status.progress} of ${status.total} (${percent}%)`;
+                                G.els.indexingFileText.textContent = status.current_file || 'Processing...';
+                            }
+                        } catch (e) {
+                            clearInterval(interval);
+                            utils.showIndexingOverlay(false);
+                            alert("An error occurred during indexing. Please check the console and try again.");
+                            G.els.rebuildIndexBtn.disabled = false;
+                            G.els.rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                        }
+                    }, 500);
+                },
+                handleSearch: async () => {
+                    const query = G.els.searchInput.value.trim();
 
-            window.showImageModal = (url) => {
-                modalImage.src = url;
-                imageModal.classList.remove('hidden');
+                    if (query.length < 3) {
+                        if (G.state.isSearching) {
+                            G.state.isSearching = false;
+                            actions.loadInitialData(); // This will reset the conversation list
+                            // Clear the right pane and show placeholder
+                            G.els.messageList.innerHTML = '';
+                            G.els.placeholder.classList.remove('hidden');
+                            G.els.currentContact.textContent = 'Select a conversation';
+                            G.els.currentNumber.textContent = '';
+                        }
+                        return;
+                    }
+                    
+                    G.state.isSearching = true;
+                    try {
+                        const results = await api.get(`/api/search?q=${encodeURIComponent(query)}`);
+                        render.conversations(results.conversations);
+                        render.searchResults(results.messages);
+                    } catch (error) {
+                        console.error('Search failed:', error);
+                        G.els.messageList.innerHTML = `<div class="text-center text-red-400">Search failed.</div>`;
+                    }
+                },
+                jumpToMessage: async (conversationId, date, conversationName) => {
+                    document.querySelectorAll('.conversation-item').forEach(el => {
+                        el.classList.toggle('active', el.dataset.conversationId == conversationId);
+                    });
+                    await actions.loadMessages(conversationId, conversationName);
+                    setTimeout(() => {
+                        const messageToHighlight = G.els.messageList.querySelector(`[data-date="${date}"]`);
+                        if (messageToHighlight) {
+                            messageToHighlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            const bubble = messageToHighlight.querySelector('.max-w-md');
+                            if (bubble) {
+                                bubble.classList.add('ring-2', 'ring-yellow-400');
+                                setTimeout(() => { bubble.classList.remove('ring-2', 'ring-yellow-400'); }, 2500);
+                            }
+                        }
+                    }, 100);
+                }
             };
 
             // --- Event Listeners ---
-            submitDirPathBtn.addEventListener('click', async () => {
-                const path = dirPathInput.value.trim();
+            G.els.submitDirPathBtn.addEventListener('click', async () => {
+                const path = G.els.dirPathInput.value.trim();
                 if (!path) {
-                    modalError.textContent = 'Path cannot be empty.';
-                    modalError.classList.remove('hidden');
+                    G.els.modalError.textContent = 'Path cannot be empty.';
+                    G.els.modalError.classList.remove('hidden');
                     return;
                 }
                 
                 try {
                     const response = await api.post('/api/set-directory', { path });
-                    modalContainer.classList.add('hidden');
-                    mainUI.classList.remove('hidden');
+                    G.els.modalContainer.classList.add('hidden');
+                    G.els.mainUI.classList.remove('hidden');
 
                     if (response.db_exists) {
-                        await loadInitialData();
+                        await actions.loadInitialData();
                     } else {
-                        await startIndexing();
+                        await actions.startIndexing();
                     }
                 } catch(e) {
-                    modalError.textContent = `Error: ${e.message}. Please check the path and server console.`;
-                    modalError.classList.remove('hidden');
+                    G.els.modalError.textContent = `Error: ${e.message}. Please check the path and server console.`;
+                    G.els.modalError.classList.remove('hidden');
                 }
             });
             
-            rebuildIndexBtn.addEventListener('click', () => {
+            G.els.rebuildIndexBtn.addEventListener('click', () => {
                 if (confirm('Are you sure you want to delete the existing index and rebuild it from scratch? This can be slow.')) {
-                    startIndexing(true);
+                    actions.startIndexing(true);
                 }
             });
             
-            searchInput.addEventListener('keyup', () => {
-                clearTimeout(searchTimeout);
-                searchTimeout = setTimeout(handleSearch, 300);
+            G.els.searchInput.addEventListener('keyup', () => {
+                clearTimeout(G.state.searchTimeout);
+                G.state.searchTimeout = setTimeout(actions.handleSearch, 300);
             });
 
-            closeImageModal.addEventListener('click', hideImageModal);
-            imageModal.addEventListener('click', (e) => {
-                if (e.target === imageModal) {
-                    hideImageModal();
-                }
+            G.els.closeImageModal.addEventListener('click', utils.hideImageModal);
+            G.els.imageModal.addEventListener('click', (e) => {
+                if (e.target === G.els.imageModal) utils.hideImageModal();
             });
 
             document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') {
-                    hideImageModal();
-                }
+                if (e.key === 'Escape') utils.hideImageModal();
             });
-
         });
     </script>
 </body>
