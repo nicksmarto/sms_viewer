@@ -22,7 +22,10 @@ everything as a familiar, searchable messaging UI — entirely offline.
   writes to or alters them.
 - **Robustness over strictness.** Real backups are messy (malformed entries, huge lines,
   duplicates). The indexer skips bad records and keeps going rather than abandoning a whole
-  file.
+  file. One quirk is repaired rather than skipped: "SMS Backup & Restore" stores emoji as
+  numeric character references to UTF-16 surrogate code points (e.g. `&#55357;&#56832;`),
+  which libxml2 turns into invalid UTF-8; these are stitched back into real characters at
+  ingest so emoji-bearing messages survive instead of being dropped.
 - **Familiar UX.** Reading should feel like a normal messaging app.
 
 ## Key decisions & rationale

@@ -27,7 +27,10 @@ DB_NAME = 'sms_messages.db'
 # v3: unique_hash now derives from normalized fields (participants/sender)
 #     instead of the raw address, so overlapping archives de-duplicate
 #     correctly. Old caches hold duplicate rows and must be rebuilt.
-CACHE_FORMAT_VERSION = 3
+# v4: emoji stored as surrogate-pair character references are repaired at
+#     ingest instead of crashing the message (see fix_surrogate_charrefs).
+#     Older caches silently dropped every emoji-bearing message; rebuild.
+CACHE_FORMAT_VERSION = 4
 
 # Your own phone number (digits only), used to identify "you" in group
 # conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
@@ -445,6 +448,56 @@ def safe_b64_decode(s: str) -> bytes:
         app.logger.warning(f"Base64 decoding failed: {e}. Input (first 50 chars): '{s[:50]}'")
         return b""
 
+# Matches a single XML numeric character reference, decimal or hex: &#128512; / &#x1F600;
+_NUMREF_RE = re.compile(r'&#(x[0-9a-fA-F]+|\d+);')
+
+
+def _numref_codepoint(token):
+    """Code point of a numeric-reference body ('x1F600' -> 0x1F600, '128512' -> 128512)."""
+    return int(token[1:], 16) if token[0] in 'xX' else int(token)
+
+
+def fix_surrogate_charrefs(text):
+    """Repair emoji stored as surrogate-pair numeric character references.
+
+    "SMS Backup & Restore" writes astral characters (emoji, etc.) as XML
+    references to UTF-16 *surrogate* code points, e.g. 😀 becomes
+    '&#55357;&#56832;'. libxml2 accepts these in recover mode but stores them
+    internally as invalid UTF-8, so lxml raises UnicodeDecodeError the moment
+    the attribute is read — and the whole message gets skipped, silently
+    losing every emoji-bearing text. Here we combine each adjacent high+low
+    surrogate pair back into the real character and drop any unpaired
+    surrogate. Non-surrogate references are left verbatim so XML
+    metacharacters (e.g. '&#60;' for '<') keep their meaning through parsing.
+    """
+    if '&#' not in text:
+        return text
+    out = []
+    last = 0                 # index up to which `text` has been copied to `out`
+    pending_hi = None        # a high surrogate awaiting its low half
+    pending_at = 0           # index just past that high-surrogate reference
+    for m in _NUMREF_RE.finditer(text):
+        cp = _numref_codepoint(m.group(1))
+        if pending_hi is not None:
+            if m.start() == pending_at and 0xDC00 <= cp <= 0xDFFF:
+                # Adjacent low surrogate: emit the combined astral character.
+                out.append(chr(0x10000 + ((pending_hi - 0xD800) << 10) + (cp - 0xDC00)))
+                pending_hi = None
+                last = m.end()
+                continue
+            pending_hi = None  # high surrogate had no low partner -> drop it
+        out.append(text[last:m.start()])  # copy literal text before this reference
+        last = m.end()
+        if 0xD800 <= cp <= 0xDBFF:
+            pending_hi, pending_at = cp, m.end()  # hold; may pair with the next ref
+        elif 0xDC00 <= cp <= 0xDFFF:
+            pass                                   # unpaired low surrogate -> drop
+        else:
+            out.append(m.group(0))                 # ordinary reference -> keep verbatim
+    out.append(text[last:])
+    return ''.join(out)
+
+
 def sanitize_xml_file(filepath):
     """Reads an XML file and yields sanitized lines, attempting multiple encodings."""
     encodings_to_try = ['utf-8', 'latin-1', 'iso-8859-1']
@@ -452,8 +505,11 @@ def sanitize_xml_file(filepath):
         try:
             with open(filepath, 'r', encoding=encoding) as f:
                 for line in f:
-                    # Remove invalid XML characters (control characters)
-                    yield re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', line)
+                    # Remove invalid XML control characters, then repair emoji
+                    # written as surrogate-pair character references (see above).
+                    yield fix_surrogate_charrefs(
+                        re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', line)
+                    )
             return  # Success
         except UnicodeDecodeError:
             app.logger.warning(f"UnicodeDecodeError with {encoding} for {filepath}. Trying next encoding.")

@@ -7,8 +7,11 @@ import unittest
 # Add the root directory to the Python path to allow importing 'app'
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from lxml import etree
+
 from app import (
     app, init_db, process_xml_files, get_db_connection, build_source_manifest,
+    fix_surrogate_charrefs,
 )
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -110,6 +113,34 @@ class TestIndexing(unittest.TestCase):
         self.assertIn('format_version', meta)
         self.assertIn('source_manifest', meta)
         self.assertEqual(meta.get('source_dir'), TEST_DIR)
+
+
+class TestSurrogateCharrefs(unittest.TestCase):
+    """'SMS Backup & Restore' stores emoji as surrogate-pair numeric character
+    references (e.g. '&#55357;&#56832;'). libxml2 turns those into invalid
+    UTF-8, so every emoji-bearing message used to be dropped on read. The
+    ingest-time repair must recover them without corrupting ordinary XML."""
+
+    def test_pair_becomes_astral_character(self):
+        self.assertEqual(fix_surrogate_charrefs("hi&#55357;&#56832;!"), "hi\U0001F600!")
+        self.assertEqual(fix_surrogate_charrefs("a&#xD83D;&#xDE00;b"), "a\U0001F600b")
+
+    def test_ordinary_references_untouched(self):
+        # '&#60;' ('<') must survive so XML parsing still sees it as data.
+        self.assertEqual(fix_surrogate_charrefs("x&#60;3"), "x&#60;3")
+        # A normal reference directly before a real pair must not be consumed.
+        self.assertEqual(fix_surrogate_charrefs("&#65;&#55357;&#56832;"), "&#65;\U0001F600")
+
+    def test_unpaired_surrogates_dropped(self):
+        self.assertEqual(fix_surrogate_charrefs("a&#55357;b"), "ab")   # lone high
+        self.assertEqual(fix_surrogate_charrefs("a&#56832;b"), "ab")   # lone low
+
+    def test_survives_round_trip_through_lxml(self):
+        """The whole point: the repaired attribute must read back cleanly."""
+        fixed = fix_surrogate_charrefs("<root><sms body='joy&#55357;&#56832;!'/></root>")
+        parser = etree.XMLParser(recover=True, huge_tree=True)
+        el = etree.fromstring(fixed.encode('utf-8'), parser=parser).find('sms')
+        self.assertEqual(el.get('body'), "joy\U0001F600!")  # no UnicodeDecodeError
 
 
 class TestSourceManifest(unittest.TestCase):
