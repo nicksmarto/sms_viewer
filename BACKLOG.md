@@ -19,6 +19,14 @@ GitHub, these can graduate into GitHub Issues (one issue per item).
   once a dependency), preserving any real camera EXIF already present.
 
 ## Architecture / hygiene
+- **Stream large XML instead of loading it whole.** `process_xml_files` reads each backup
+  fully into memory (as a string, then re-encoded to bytes, then a complete lxml DOM) — a
+  ~20 GB+ peak for the 7.9 GB `master-sms.xml`. It works today but is the one place a bigger
+  archive or a lower-RAM machine could hit `MemoryError`. Refactor to a streaming parse
+  (`lxml.etree.iterparse`, clearing each element after use) for constant memory. Pairs well
+  with **Incremental indexing** below. Note: the surrogate-emoji repair currently runs
+  per-line during sanitize; keep that working (surrogate pairs stay within one element, so
+  per-element repair is fine).
 - **Make assumptions configurable.** The UTC-6 timezone assumption and DB filename are
   baked in; expose them as config where it makes sense.
 - **Auto-prune orphaned caches on startup.** Clearing caches whose source folder is gone is
@@ -58,6 +66,16 @@ GitHub, these can graduate into GitHub Issues (one issue per item).
   everyday case for now.
 
 ## Done
+- ✅ **De-duplication across overlapping archives** — the message identity hash now derives
+  from normalized fields (sorted participants, sender) instead of the raw address, so the same
+  message from multiple backups (different number formatting or group ordering) collapses to
+  one row. Removed ~45k duplicate rows from the real archive.
+- ✅ **Recover emoji messages** — emoji stored as surrogate-pair XML character references
+  (`&#55357;&#56832;`) are repaired at ingest instead of crashing the message on read;
+  recovered ~7,100 previously-dropped texts.
+- ✅ **Robust address handling** — group addresses with an unnormalizable member no longer
+  crash the sort, and MMS without a top-level `address` attribute index off their `<addr>`
+  nodes instead of being skipped.
 - ✅ Clean single Git repo with SemVer tags; privacy-enforcing `.gitignore`.
 - ✅ Removed a leaked API key and personal phone number from all history; `.env` config.
 - ✅ One-click launchers (`run.command` / `run.bat`) that auto-create the venv.
