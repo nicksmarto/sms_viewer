@@ -11,7 +11,7 @@ from lxml import etree
 
 from app import (
     app, init_db, process_xml_files, get_db_connection, build_source_manifest,
-    fix_surrogate_charrefs,
+    fix_surrogate_charrefs, normalize_number,
 )
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,6 +141,37 @@ class TestSurrogateCharrefs(unittest.TestCase):
         parser = etree.XMLParser(recover=True, huge_tree=True)
         el = etree.fromstring(fixed.encode('utf-8'), parser=parser).find('sms')
         self.assertEqual(el.get('body'), "joy\U0001F600!")  # no UnicodeDecodeError
+
+
+class TestNormalizeNumber(unittest.TestCase):
+    """Group addresses and odd inputs must normalize without raising — a crash
+    here skips the whole message during indexing."""
+
+    def test_none_and_empty(self):
+        self.assertIsNone(normalize_number(None))
+        self.assertIsNone(normalize_number(""))
+
+    def test_strips_country_code_and_punctuation(self):
+        self.assertEqual(normalize_number("+1 (716) 555-1234"), "7165551234")
+
+    def test_group_is_sorted_and_order_independent(self):
+        # Same members in either order yield the same identity.
+        self.assertEqual(
+            normalize_number("7165551234~2015551234"),
+            normalize_number("2015551234~7165551234"),
+        )
+
+    def test_group_with_unnormalizable_member_does_not_crash(self):
+        # An alphanumeric short code (VZWPMSG) drops out instead of raising
+        # "'<' not supported between 'NoneType' and 'str'" during the sort.
+        self.assertEqual(normalize_number("7165551234~VZWPMSG"), "7165551234")
+        self.assertEqual(normalize_number("VZWPMSG~7165551234"), "7165551234")
+
+    def test_group_with_empty_member_does_not_crash(self):
+        self.assertEqual(
+            normalize_number("7165551234~~2015551234"),
+            "2015551234~7165551234",
+        )
 
 
 class TestSourceManifest(unittest.TestCase):

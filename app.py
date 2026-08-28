@@ -30,7 +30,10 @@ DB_NAME = 'sms_messages.db'
 # v4: emoji stored as surrogate-pair character references are repaired at
 #     ingest instead of crashing the message (see fix_surrogate_charrefs).
 #     Older caches silently dropped every emoji-bearing message; rebuild.
-CACHE_FORMAT_VERSION = 4
+# v5: group addresses with an unnormalizable member no longer crash (and are
+#     dropped from the sort), and MMS without a top-level address are kept
+#     via their <addr> nodes. Recovers a small number of skipped messages.
+CACHE_FORMAT_VERSION = 5
 
 # Your own phone number (digits only), used to identify "you" in group
 # conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
@@ -391,10 +394,12 @@ def normalize_number(phone_number):
     # Handle group conversations
     if '~' in phone_number:
         numbers = [re.sub(r'\D', '', num) for num in phone_number.split('~') if num]
-        normalized_numbers = [normalize_number(n) for n in numbers]
-        # Sort for consistency
-        normalized_numbers.sort()
-        return '~'.join(filter(None, normalized_numbers))
+        # Drop components that don't normalize (e.g. alphanumeric short codes)
+        # BEFORE sorting — a list mixing None and str is unsortable and would
+        # raise "'<' not supported between 'NoneType' and 'str'".
+        normalized_numbers = [n for n in (normalize_number(n) for n in numbers) if n]
+        normalized_numbers.sort()  # sort for a stable, order-independent identity
+        return '~'.join(normalized_numbers)
 
     letter_map = {
         'a': '2', 'b': '2', 'c': '2', 'd': '3', 'e': '3', 'f': '3',
@@ -680,14 +685,21 @@ def process_xml_files():
                     if max_date is None or date > max_date: max_date = date
 
                     address = elem.get('address')
-                    
-                    # Skip normalization if the address is likely a name (contains letters) and not a group chat
-                    if '~' not in address and re.search('[a-zA-Z]', address):
+
+                    # A missing address, or one that is a name (has letters) and
+                    # not a group ('~'), has no usable normalized form. Guard the
+                    # membership test: `elem.get('address')` is None on some MMS.
+                    if not address or ('~' not in address and re.search('[a-zA-Z]', address)):
                         normalized_address = None
                     else:
                         normalized_address = normalize_number(address)
 
-                    if not normalized_address: continue
+                    # For SMS the address IS the conversation, so an unusable one
+                    # means skip. MMS derives its participants from the <addr>
+                    # nodes below, so let it proceed even without a top-level
+                    # address (guarded again once participants are known).
+                    if elem.tag == 'sms' and not normalized_address:
+                        continue
 
                     if elem.tag == 'sms':
                         msg_data = {
@@ -713,13 +725,20 @@ def process_xml_files():
                             participant_addrs.discard(MY_PHONE_NUMBER)
                         participants = '~'.join(sorted(list(filter(None, participant_addrs)))) or normalized_address
 
+                        # No usable participants (no top-level address AND no
+                        # numeric <addr> nodes) — nothing to attach this to.
+                        if not participants:
+                            continue
+
                         from_address_node = elem.find(".//addr[@type='137']")
                         from_address = normalize_number(from_address_node.get('address')) if from_address_node is not None else None
-                        
+
                         message_type = elem.get('msg_box', '1')
 
                         base_msg_data = {
-                            'address': address, 'date': date, 'type': message_type,
+                            # `address` is NOT NULL in the schema; fall back to the
+                            # participants string when the MMS omits a top-level one.
+                            'address': address or participants, 'date': date, 'type': message_type,
                             'readable_date': elem.get('readable_date'),
                             'sender_address': from_address, 'participants': participants
                         }
