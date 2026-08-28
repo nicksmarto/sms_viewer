@@ -33,7 +33,12 @@ DB_NAME = 'sms_messages.db'
 # v5: group addresses with an unnormalizable member no longer crash (and are
 #     dropped from the sort), and MMS without a top-level address are kept
 #     via their <addr> nodes. Recovers a small number of skipped messages.
-CACHE_FORMAT_VERSION = 5
+# v6: analytics dashboard. Indexing now records per-source-file provenance
+#     (which XML file each logical message came from, including occurrences
+#     that de-duplication drops) so the dashboard can report per-file counts,
+#     date spans, and cross-file overlap. Old caches have no provenance tables;
+#     rebuild to populate them.
+CACHE_FORMAT_VERSION = 6
 
 # Your own phone number (digits only), used to identify "you" in group
 # conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
@@ -314,7 +319,50 @@ def init_db():
                     key TEXT PRIMARY KEY, value TEXT
                 );
             ''')
+            # --- Analytics provenance tables (v6) --------------------------
+            # One row per constituent XML backup file. All aggregates are
+            # computed during indexing (see process_xml_files); the dashboard
+            # only reads them.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS source_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    mtime INTEGER,
+                    date_min INTEGER,           -- epoch ms, from this file's messages
+                    date_max INTEGER,
+                    msg_count INTEGER,          -- distinct logical messages in this file
+                    mms_count INTEGER,          -- MMS entities kept from this file
+                    redundant_count INTEGER,    -- of msg_count, how many also appear elsewhere
+                    unique_only_count INTEGER,  -- messages found ONLY in this file (0 => fully covered)
+                    safe_to_delete INTEGER      -- 1 if in the computed zero-loss deletable set
+                );
+            ''')
+            # Compact occurrence map: which logical messages each file contains,
+            # keyed by the stable message-identity hash (NOT a column on the
+            # messages table). Keyed by hash rather than message id so that
+            # byte-level media de-duplication cannot hide a genuinely distinct
+            # message from the overlap math — safety over storage.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS file_messages (
+                    file_id INTEGER NOT NULL,
+                    msg_hash TEXT NOT NULL,
+                    PRIMARY KEY (file_id, msg_hash)
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_file_messages_hash ON file_messages (msg_hash);')
+            # Pairwise shared-message counts for the overlap drill-down.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS file_overlap (
+                    file_a INTEGER NOT NULL,
+                    file_b INTEGER NOT NULL,
+                    shared_count INTEGER NOT NULL,
+                    PRIMARY KEY (file_a, file_b)
+                );
+            ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_participants ON messages (participants);')
+            # Time-bucketed analytics queries scan by date; index it.
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON messages (date);')
         
         app.logger.info("Database initialization complete.")
         return True
@@ -415,6 +463,19 @@ def normalize_number(phone_number):
         return digits_only[1:]
     return digits_only
 
+OBJ_REPLACEMENT_CHAR = '￼'  # U+FFFC, iMessage's inline-attachment placeholder
+
+
+def clean_message_text(text):
+    """Strip the object-replacement char (U+FFFC) that iMessage embeds in a
+    message's text where an inline attachment sits. Left in, it renders as a
+    phantom blank bubble next to the actual media. Text that is ONLY the
+    placeholder collapses to empty and gets dropped by the callers."""
+    if not text:
+        return text
+    return text.replace(OBJ_REPLACEMENT_CHAR, '')
+
+
 def generate_unique_hash(msg, part_identifier=""):
     """Stable identity for a logical message, used to de-duplicate across
     overlapping archives (the same conversation history often lands in several
@@ -425,18 +486,110 @@ def generate_unique_hash(msg, part_identifier=""):
     vs '4126564424') and list group participants in a different order
     ('A~B' vs 'B~A'). The raw address therefore varies for what is really the
     same message, which defeated de-duplication. `participants` is already
-    normalized and sorted, and `sender_address` is already normalized, so the
-    same message hashes identically no matter which archive it came from.
+    normalized and sorted, so the same message hashes identically no matter
+    which archive it came from.
+
+    `sender_address` is deliberately NOT part of the identity: different
+    sources record the sender inconsistently (e.g. one archive stores a sent
+    message's sender as a phone number, another as an Apple-ID email that
+    normalize_number mangles into a long digit string), which produced
+    spurious duplicates of the same logical message.
+
+    `date` is compared at WHOLE-SECOND precision, not milliseconds. The same
+    message often carries slightly different sub-second timestamps across
+    sources (an iPhone/Mac chat.db export lands on the whole second, e.g.
+    ...797000, while an Android SMS Backup & Restore archive kept the real
+    ...797137), which likewise defeated de-duplication. Flooring to the second
+    makes them match. `participants` + `date`(sec) + `body` + `type` identify a
+    message uniquely — a real collision needs two DIFFERENT messages with
+    identical text, box and participants inside the same one-second window,
+    which does not happen in practice.
     """
+    raw_date = msg.get('date', '') or ''
+    try:
+        date_key = str(int(raw_date) // 1000)  # ms -> whole seconds
+    except (ValueError, TypeError):
+        date_key = str(raw_date)
     data = "-".join(str(x) for x in (
         msg.get('participants', '') or '',
-        msg.get('date', '') or '',
+        date_key,
         msg.get('body', '') or '',
         msg.get('type', '') or '',
-        msg.get('sender_address', '') or '',
         part_identifier,
     ))
     return hashlib.sha256(data.encode('utf-8')).hexdigest()
+
+
+def compute_redundancy(file_sizes, file_to_msgs):
+    """Overlap analysis for the analytics dashboard. Pure function (no I/O) so
+    it is unit-testable.
+
+    Args:
+        file_sizes: {file_id: (size_bytes, msg_count)} — used only to order the
+            greedy deletion pass (delete smaller files first, i.e. keep the
+            larger ones).
+        file_to_msgs: {file_id: set(message_identity)} — the messages each file
+            contains. Identities are opaque hashables (hashes).
+
+    Returns a dict:
+        {
+          'per_file': {file_id: {
+                'redundant_count': int,     # messages also present in >=1 other file
+                'unique_only_count': int,   # messages present ONLY in this file
+                'safe_to_delete': bool,     # in the computed zero-loss deletable set
+          }},
+          'overlap_rows': [(file_a, file_b, shared_count), ...],  # a<b, shared>0
+        }
+
+    Safe-to-delete guarantee: a file is marked deletable only if EVERY message it
+    holds still exists in at least one file that is being kept. The greedy pass
+    walks files smallest-first and decrements live coverage as it removes each,
+    so the union of the retained files always covers every message — zero loss —
+    even when a message is shared across three or more files.
+    """
+    # Coverage = how many files contain each message identity.
+    coverage = {}
+    for msgs in file_to_msgs.values():
+        for m in msgs:
+            coverage[m] = coverage.get(m, 0) + 1
+
+    per_file = {}
+    for fid, msgs in file_to_msgs.items():
+        redundant = sum(1 for m in msgs if coverage[m] >= 2)
+        per_file[fid] = {
+            'redundant_count': redundant,
+            'unique_only_count': len(msgs) - redundant,
+            'safe_to_delete': False,
+        }
+
+    # Greedy zero-loss deletion set. Order: smallest file first (by size, then
+    # fewer messages) so we prefer deleting small files and keeping large ones.
+    live = dict(coverage)  # mutable copy we decrement as we "delete"
+    order = sorted(
+        file_to_msgs.keys(),
+        key=lambda fid: (file_sizes.get(fid, (0, 0))[0], file_sizes.get(fid, (0, 0))[1]),
+    )
+    for fid in order:
+        msgs = file_to_msgs[fid]
+        # Deletable iff every message it holds is still covered elsewhere.
+        if all(live[m] >= 2 for m in msgs):
+            per_file[fid]['safe_to_delete'] = True
+            for m in msgs:
+                live[m] -= 1
+
+    # Pairwise overlap (N files is small — dozens — so N^2 is fine).
+    overlap_rows = []
+    fids = sorted(file_to_msgs.keys())
+    for i in range(len(fids)):
+        a = fids[i]
+        for j in range(i + 1, len(fids)):
+            b = fids[j]
+            shared = len(file_to_msgs[a] & file_to_msgs[b])
+            if shared:
+                overlap_rows.append((a, b, shared))
+
+    return {'per_file': per_file, 'overlap_rows': overlap_rows}
+
 
 def safe_b64_decode(s: str) -> bytes:
     """Safely decodes a base64 string, handling padding and whitespace."""
@@ -653,7 +806,14 @@ def process_xml_files():
     effective_spam = {n for n in load_spam_numbers(xml_directory) if n not in all_contact_names}
     total_mms_count, total_media_files_found = 0, 0
     processed_media_hashes = set()
-    
+
+    # A rebuild reuses the same DB file, so clear any prior run's provenance
+    # before re-recording it (messages themselves are INSERT OR IGNORE'd).
+    with conn:
+        conn.execute('DELETE FROM source_files')
+        conn.execute('DELETE FROM file_messages')
+        conn.execute('DELETE FROM file_overlap')
+
     if all_contact_names:
         with conn:
             conn.executemany(
@@ -667,7 +827,23 @@ def process_xml_files():
         
         messages_to_insert = []
         min_date, max_date = None, None
-        
+
+        # Provenance for this file: the set of logical-message identities it
+        # contains (incl. ones de-duplication will drop), and its own MMS count.
+        file_hashes = set()
+        file_mms_count = 0
+        try:
+            st = os.stat(filepath)
+            f_size, f_mtime = st.st_size, int(st.st_mtime)
+        except OSError:
+            f_size, f_mtime = None, None
+        with conn:
+            cur = conn.execute(
+                'INSERT INTO source_files (filename, size_bytes, mtime, msg_count, mms_count) VALUES (?, ?, ?, 0, 0)',
+                (filename, f_size, f_mtime),
+            )
+        file_id = cur.lastrowid
+
         # Use a dummy root to handle files with multiple root elements
         sanitized_content = "<root>" + "".join(sanitize_xml_file(filepath)) + "</root>"
         
@@ -704,13 +880,14 @@ def process_xml_files():
                     if elem.tag == 'sms':
                         msg_data = {
                             'address': address, 'date': date, 'type': elem.get('type', '1'),
-                            'readable_date': elem.get('readable_date'), 'body': elem.get('body', ''),
+                            'readable_date': elem.get('readable_date'), 'body': clean_message_text(elem.get('body', '')),
                             'mms_media_path': None, 'mms_media_type': None, 
                             'sender_address': normalized_address, 'participants': normalized_address
                         }
                         msg_data['unique_hash'] = generate_unique_hash(msg_data, part_identifier='sms')
                         messages_to_insert.append(msg_data)
-                    
+                        file_hashes.add(msg_data['unique_hash'])
+
                     elif elem.tag == 'mms':
                         total_mms_count += 1
                         
@@ -729,6 +906,8 @@ def process_xml_files():
                         # numeric <addr> nodes) — nothing to attach this to.
                         if not participants:
                             continue
+
+                        file_mms_count += 1
 
                         from_address_node = elem.find(".//addr[@type='137']")
                         from_address = normalize_number(from_address_node.get('address')) if from_address_node is not None else None
@@ -752,7 +931,9 @@ def process_xml_files():
                             data = part.get('data')
 
                             if ct == 'text/plain' and text:
-                                mms_body_parts.append(text)
+                                cleaned = clean_message_text(text).strip()
+                                if cleaned:  # drop parts that are only the ￼ placeholder
+                                    mms_body_parts.append(cleaned)
                             elif ct.startswith(('image/', 'video/', 'audio/')) and data:
                                 media_parts.append({'ct': ct, 'data': data})
 
@@ -763,18 +944,30 @@ def process_xml_files():
                             })
                             text_msg['unique_hash'] = generate_unique_hash(text_msg, part_identifier="text")
                             messages_to_insert.append(text_msg)
+                            file_hashes.add(text_msg['unique_hash'])
 
                         for part in media_parts:
                             decoded_data = safe_b64_decode(part['data'])
                             if not decoded_data: continue
 
                             file_hash = hashlib.sha256(decoded_data).hexdigest()
+
+                            # This media part's stable message identity. Record it
+                            # as belonging to THIS file for overlap accounting even
+                            # if the bytes were already extracted from an earlier
+                            # file — otherwise a file's contribution is undercounted
+                            # and it could be wrongly judged redundant. The identity
+                            # matches the row's eventual unique_hash exactly (body is
+                            # "" on media rows), so it de-duplicates identically.
+                            media_msg = base_msg_data.copy()
+                            media_msg['body'] = ""
+                            media_unique_hash = generate_unique_hash(media_msg, part_identifier=f"media_{file_hash}")
+                            file_hashes.add(media_unique_hash)
+
                             if file_hash in processed_media_hashes: continue
                             processed_media_hashes.add(file_hash)
                             total_media_files_found += 1
 
-                            media_msg = base_msg_data.copy()
-                            
                             sender_name = all_contact_names.get(from_address, from_address)
                             dt_object = datetime.fromtimestamp(date / 1000.0)
                             date_name = dt_object.strftime('%Y-%m-%d %H-%M-%S')
@@ -807,7 +1000,7 @@ def process_xml_files():
                                 'body': "", 'mms_media_path': os.path.join(sender_folder, final_filename),
                                 'mms_media_type': part['ct']
                             })
-                            media_msg['unique_hash'] = generate_unique_hash(media_msg, part_identifier=f"media_{file_hash}")
+                            media_msg['unique_hash'] = media_unique_hash
                             messages_to_insert.append(media_msg)
 
                 except (ValueError, TypeError, AttributeError) as e:
@@ -825,6 +1018,18 @@ def process_xml_files():
                 ''', messages_to_insert)
             indexing_status['messages_indexed'] += len(messages_to_insert)
 
+        # Record which logical messages this file contained, and its aggregates.
+        with conn:
+            if file_hashes:
+                conn.executemany(
+                    'INSERT OR IGNORE INTO file_messages (file_id, msg_hash) VALUES (?, ?)',
+                    [(file_id, h) for h in file_hashes],
+                )
+            conn.execute(
+                'UPDATE source_files SET date_min = ?, date_max = ?, msg_count = ?, mms_count = ? WHERE id = ?',
+                (min_date, max_date, len(file_hashes), file_mms_count, file_id),
+            )
+
         min_date_str = datetime.fromtimestamp(min_date / 1000.0).strftime('%Y-%m-%d') if min_date else "N/A"
         max_date_str = datetime.fromtimestamp(max_date / 1000.0).strftime('%Y-%m-%d') if max_date else "N/A"
         indexing_status.update({
@@ -835,6 +1040,32 @@ def process_xml_files():
 
     indexing_status['phase'] = 'finalizing'
     app.logger.info(f"\nProcessed {total_mms_count} MMS messages, found {total_media_files_found} media files")
+
+    # --- Cross-file overlap / redundancy analysis --------------------------
+    # All per-file identity sets are now in file_messages. Compute how much of
+    # each file is duplicated elsewhere and which files are safe to delete with
+    # zero message loss, then store the results for the dashboard to read.
+    file_rows = conn.execute('SELECT file_id, msg_hash FROM file_messages').fetchall()
+    file_to_msgs = {}
+    for r in file_rows:
+        file_to_msgs.setdefault(r['file_id'], set()).add(r['msg_hash'])
+    file_sizes = {
+        r['id']: (r['size_bytes'] or 0, r['msg_count'] or 0)
+        for r in conn.execute('SELECT id, size_bytes, msg_count FROM source_files')
+    }
+    if file_to_msgs:
+        redundancy = compute_redundancy(file_sizes, file_to_msgs)
+        with conn:
+            for fid, s in redundancy['per_file'].items():
+                conn.execute(
+                    'UPDATE source_files SET redundant_count = ?, unique_only_count = ?, safe_to_delete = ? WHERE id = ?',
+                    (s['redundant_count'], s['unique_only_count'], 1 if s['safe_to_delete'] else 0, fid),
+                )
+            if redundancy['overlap_rows']:
+                conn.executemany(
+                    'INSERT OR REPLACE INTO file_overlap (file_a, file_b, shared_count) VALUES (?, ?, ?)',
+                    redundancy['overlap_rows'],
+                )
 
     with conn:
         total_messages = conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
@@ -878,6 +1109,16 @@ def run_indexing():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/analytics')
+def analytics():
+    return render_template('analytics.html')
+
+@app.route('/vendor/<path:filename>')
+def vendor(filename):
+    """Serve locally-vendored front-end libraries (e.g. ECharts) so the app has
+    no CDN dependency and works fully offline."""
+    return send_from_directory(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vendor'), filename)
 
 @app.route('/api/browse-folder', methods=['POST'])
 def browse_folder():
@@ -1096,9 +1337,190 @@ def get_stats():
     finally:
         conn.close()
 
+def _months_between(ym_min, ym_max):
+    """Inclusive list of 'YYYY-MM' strings from ym_min to ym_max."""
+    if not ym_min or not ym_max:
+        return []
+    y, m = int(ym_min[:4]), int(ym_min[5:7])
+    ey, em = int(ym_max[:4]), int(ym_max[5:7])
+    out = []
+    while (y, m) <= (ey, em):
+        out.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return out
+
+
+@app.route('/api/analytics')
+def get_analytics():
+    """Aggregate data for the analytics dashboard. All reads — the heavy overlap
+    computation happens once during indexing (see process_xml_files)."""
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({'error': 'Could not connect to database.'}), 500
+    # Bucket by the machine's local time, matching how dates are shown elsewhere.
+    LT = "'unixepoch', 'localtime'"
+    try:
+        # --- Message volume over time (monthly), gaps filled with zeros -----
+        rows = conn.execute(
+            f"SELECT strftime('%Y-%m', date/1000, {LT}) ym, COUNT(*) c "
+            "FROM messages GROUP BY ym ORDER BY ym"
+        ).fetchall()
+        counts = {r['ym']: r['c'] for r in rows if r['ym']}
+        months = _months_between(rows[0]['ym'], rows[-1]['ym']) if counts else []
+        histogram = [{'month': m, 'count': counts.get(m, 0)} for m in months]
+
+        # --- Constituent source files + overlap/redundancy -----------------
+        files = []
+        reclaimable_bytes, safe_count = 0, 0
+        for r in conn.execute(
+            'SELECT id, filename, size_bytes, mtime, date_min, date_max, msg_count, '
+            'mms_count, redundant_count, unique_only_count, safe_to_delete '
+            'FROM source_files ORDER BY date_min'
+        ):
+            msg_count = r['msg_count'] or 0
+            redundant = r['redundant_count'] or 0
+            files.append({
+                'id': r['id'],
+                'filename': r['filename'],
+                'size_bytes': r['size_bytes'] or 0,
+                'date_min': r['date_min'],
+                'date_max': r['date_max'],
+                'date_range': (f"{_fmt_date(r['date_min'])} to {_fmt_date(r['date_max'])}"
+                               if r['date_min'] and r['date_max'] else ''),
+                'msg_count': msg_count,
+                'mms_count': r['mms_count'] or 0,
+                'redundant_count': redundant,
+                'unique_only_count': r['unique_only_count'] or 0,
+                'redundant_pct': round(100.0 * redundant / msg_count, 1) if msg_count else 0.0,
+                'safe_to_delete': bool(r['safe_to_delete']),
+            })
+            if r['safe_to_delete']:
+                safe_count += 1
+                reclaimable_bytes += r['size_bytes'] or 0
+        overlap = [
+            {'file_a': r['file_a'], 'file_b': r['file_b'], 'shared_count': r['shared_count']}
+            for r in conn.execute('SELECT file_a, file_b, shared_count FROM file_overlap')
+        ]
+        files_summary = {
+            'total_files': len(files),
+            'safe_to_delete_count': safe_count,
+            'reclaimable_bytes': reclaimable_bytes,
+        }
+
+        # --- Top contacts ---------------------------------------------------
+        names = {r['address']: r['name'] for r in conn.execute('SELECT address, name FROM contact_names')}
+
+        def label_for(participants):
+            parts = (participants or '').split('~')
+            labelled = [names.get(p, p) for p in parts if p]
+            return ', '.join(labelled) if labelled else (participants or 'Unknown')
+
+        top_contacts = []
+        for r in conn.execute(
+            'SELECT participants, COUNT(*) c, MIN(date) first, MAX(date) last '
+            'FROM messages GROUP BY participants ORDER BY c DESC LIMIT 15'
+        ):
+            top_contacts.append({
+                'participants': r['participants'],
+                'label': label_for(r['participants']),
+                'count': r['c'],
+                'first_date': _fmt_date(r['first']),
+                'last_date': _fmt_date(r['last']),
+            })
+
+        # --- Sent vs received (overall + per year) --------------------------
+        sr = conn.execute(
+            "SELECT CASE WHEN CAST(type AS INT)=2 THEN 'sent' ELSE 'received' END dir, COUNT(*) c "
+            "FROM messages GROUP BY dir"
+        ).fetchall()
+        sent_received = {'sent': 0, 'received': 0, 'by_year': []}
+        for r in sr:
+            sent_received[r['dir']] = r['c']
+        by_year = {}
+        for r in conn.execute(
+            f"SELECT strftime('%Y', date/1000, {LT}) y, "
+            "SUM(CASE WHEN CAST(type AS INT)=2 THEN 1 ELSE 0 END) sent, "
+            "SUM(CASE WHEN CAST(type AS INT)=2 THEN 0 ELSE 1 END) received "
+            "FROM messages GROUP BY y ORDER BY y"
+        ):
+            if r['y']:
+                by_year[r['y']] = {'year': r['y'], 'sent': r['sent'] or 0, 'received': r['received'] or 0}
+        sent_received['by_year'] = list(by_year.values())
+
+        # --- Activity heatmap: weekday (0=Sun) x hour (0-23) ----------------
+        heatmap = [[0] * 24 for _ in range(7)]
+        for r in conn.execute(
+            f"SELECT CAST(strftime('%w', date/1000, {LT}) AS INT) dow, "
+            f"CAST(strftime('%H', date/1000, {LT}) AS INT) hr, COUNT(*) c "
+            "FROM messages GROUP BY dow, hr"
+        ):
+            if r['dow'] is not None and r['hr'] is not None:
+                heatmap[r['dow']][r['hr']] = r['c']
+
+        # --- Yearly totals + records ---------------------------------------
+        yearly = [
+            {'year': r['y'], 'count': r['c'], 'media': r['media'] or 0}
+            for r in conn.execute(
+                f"SELECT strftime('%Y', date/1000, {LT}) y, COUNT(*) c, "
+                "SUM(CASE WHEN mms_media_path IS NOT NULL THEN 1 ELSE 0 END) media "
+                "FROM messages GROUP BY y ORDER BY y"
+            ) if r['y']
+        ]
+        busiest = conn.execute(
+            f"SELECT strftime('%Y-%m-%d', date/1000, {LT}) d, COUNT(*) c "
+            "FROM messages GROUP BY d ORDER BY c DESC LIMIT 1"
+        ).fetchone()
+        db_bytes = os.path.getsize(app.config['DB_PATH']) if app.config.get('DB_PATH') else 0
+        media_bytes = _dir_size_bytes(app.config['MEDIA_DIR']) if app.config.get('MEDIA_DIR') else 0
+        records = {
+            'busiest_day': busiest['d'] if busiest else '',
+            'busiest_day_count': busiest['c'] if busiest else 0,
+            'total_media': conn.execute('SELECT COUNT(*) FROM messages WHERE mms_media_path IS NOT NULL').fetchone()[0],
+            'db_bytes': db_bytes,
+            'media_bytes': media_bytes,
+        }
+
+        return jsonify({
+            'histogram': histogram,
+            'files': files,
+            'files_summary': files_summary,
+            'overlap': overlap,
+            'top_contacts': top_contacts,
+            'sent_received': sent_received,
+            'heatmap': heatmap,
+            'yearly': yearly,
+            'records': records,
+        })
+    except sqlite3.OperationalError as e:
+        return jsonify({'error': f'Database is not initialized correctly: {e}'}), 500
+    finally:
+        conn.close()
+
+
+# Media whose stored extension mislabels a browser-playable codec. iPhone
+# .mov/.3gp clips are almost always H.264, which every browser can decode —
+# they only fail because '.quicktime'/'.3gpp' resolve to a MIME the <video>
+# tag rejects. Serving the SAME bytes as video/mp4 lets the browser's own
+# H.264 decoder play them, with no transcoding. (True HEVC clips still won't
+# play in Chrome; that is a codec limit, not a container/MIME one.)
+_MEDIA_MIME_OVERRIDE = {
+    '.quicktime': 'video/mp4',
+    '.mov': 'video/mp4',
+    '.3gpp': 'video/mp4',
+    '.3gp': 'video/mp4',
+}
+
+
 @app.route('/api/media/<path:filename>')
 def get_media(filename):
     media_dir = app.config.get("MEDIA_DIR")
+    ext = os.path.splitext(filename)[1].lower()
+    override = _MEDIA_MIME_OVERRIDE.get(ext)
+    if override:
+        return send_from_directory(media_dir, filename, mimetype=override)
     return send_from_directory(media_dir, filename)
 
 @app.route('/api/export-media', methods=['POST'])
@@ -1219,32 +1641,55 @@ def search_messages():
     if conn is None:
         return jsonify({'error': 'Database not available.'}), 500
 
+    # Match on the contact NAME and on the literal text typed. Additionally,
+    # when the query contains a runof digits (a phone number, possibly with
+    # formatting like "(720) 243-3345"), match those digits against the
+    # normalized digits-only `participants`/`address` so a conversation is
+    # findable by number even when it has a contact name. The digit clauses
+    # are only added when digits are actually present — a bare '%' or a
+    # null-byte sentinel would otherwise match every row.
+    like = f'%{query_term}%'
+    digits = re.sub(r'\D', '', query_term)
+    has_digits = len(digits) >= 3
+    dlike = f'%{digits}%'
+
     try:
-        # Search for conversations by contact name
-        conv_query = '''
-            SELECT 
-                participants as address, 
-                MAX(date) as last_message_date, 
-                COUNT(id) as message_count,
-                SUM(CASE WHEN mms_media_path IS NOT NULL THEN 1 ELSE 0 END) as image_count,
-                COALESCE(cn.name, participants) as contact_name
-            FROM messages
-            LEFT JOIN contact_names cn ON messages.participants = cn.address
-            WHERE contact_name LIKE ?
-            GROUP BY participants 
-            ORDER BY last_message_date DESC
-        '''
         eff_spam = effective_spam_set(app.config.get('XML_DIRECTORY'), conn)
 
         def _is_spam(participants_str):
             parts = (participants_str or '').split('~')
             return bool(eff_spam) and bool(parts) and all(p in eff_spam for p in parts)
 
-        conv_rows = conn.execute(conv_query, (f'%{query_term}%',)).fetchall()
+        # Conversations: by contact name, by the literal text, and (if the
+        # query has digits) by number.
+        conv_where = 'contact_name LIKE ? OR participants LIKE ?'
+        conv_params = [like, like]
+        if has_digits:
+            conv_where += ' OR participants LIKE ?'
+            conv_params.append(dlike)
+        conv_query = f'''
+            SELECT
+                participants as address,
+                MAX(date) as last_message_date,
+                COUNT(id) as message_count,
+                SUM(CASE WHEN mms_media_path IS NOT NULL THEN 1 ELSE 0 END) as image_count,
+                COALESCE(cn.name, participants) as contact_name
+            FROM messages
+            LEFT JOIN contact_names cn ON messages.participants = cn.address
+            WHERE {conv_where}
+            GROUP BY participants
+            ORDER BY last_message_date DESC
+        '''
+        conv_rows = conn.execute(conv_query, conv_params).fetchall()
         conversations = [dict(row) for row in conv_rows if not _is_spam(row['address'])]
 
-        # Search for messages by body content
-        msg_query = '''
+        # Messages: by body content, and (if the query has digits) by number.
+        msg_where = 'm.body LIKE ?'
+        msg_params = [like]
+        if has_digits:
+            msg_where += ' OR m.participants LIKE ? OR m.address LIKE ?'
+            msg_params += [dlike, dlike]
+        msg_query = f'''
             SELECT
                 m.id, m.address, m.date, m.type, m.body, m.mms_media_path, m.mms_media_type, m.readable_date,
                 m.participants,
@@ -1253,11 +1698,11 @@ def search_messages():
             FROM messages m
             LEFT JOIN contact_names c ON m.participants = c.address
             LEFT JOIN contact_names s ON m.sender_address = s.address
-            WHERE m.body LIKE ?
+            WHERE {msg_where}
             ORDER BY m.date DESC
             LIMIT 100
         '''
-        msg_rows = conn.execute(msg_query, (f'%{query_term}%',)).fetchall()
+        msg_rows = conn.execute(msg_query, msg_params).fetchall()
         messages = [dict(row) for row in msg_rows if not _is_spam(row['participants'])]
 
         return jsonify({'conversations': conversations, 'messages': messages})

@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SMS Backup Viewer v2.1</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Vendored libheif (WASM) — decodes HEIC/HEIF images the browser can't render, client-side. -->
+    <script src="/vendor/heic2any.min.js"></script>
     <style>
         /* Simple scrollbar styling */
         ::-webkit-scrollbar { width: 8px; }
@@ -227,6 +229,46 @@
                     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
                     const i = Math.floor(Math.log(n) / Math.log(1024));
                     return `${(n / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`;
+                },
+                // Decode HEIC/HEIF <img data-heic-src> placeholders to viewable
+                // JPEGs in the browser via the vendored heic2any (libheif WASM).
+                // No server transcode; the stored .heic bytes are untouched.
+                // Lazy per-image so a conversation full of HEIC doesn't stall.
+                hydrateHeic: (container) => {
+                    const imgs = container.querySelectorAll('img[data-heic-src]');
+                    if (!imgs.length) return;
+                    const decode = async (img) => {
+                        if (img.dataset.heicDone) return;
+                        img.dataset.heicDone = '1';
+                        const url = img.dataset.heicSrc;
+                        try {
+                            if (typeof heic2any === 'undefined') throw new Error('decoder unavailable');
+                            const blob = await (await fetch(url)).blob();
+                            let out = await heic2any({ blob, toType: 'image/jpeg', quality: 0.9 });
+                            if (Array.isArray(out)) out = out[0];
+                            const objUrl = URL.createObjectURL(out);
+                            img.src = objUrl;
+                            img.classList.remove('heic-pending');
+                            img.classList.add('cursor-pointer');
+                            img.removeAttribute('style');
+                            img.title = ''; img.alt = 'MMS image';
+                            img.onclick = () => window.showImageModal(objUrl);
+                        } catch (e) {
+                            const a = document.createElement('a');
+                            a.href = url; a.setAttribute('download', '');
+                            a.className = 'text-blue-400 underline text-sm';
+                            a.textContent = '⬇ HEIC image (preview unavailable) — download';
+                            img.replaceWith(a);
+                        }
+                    };
+                    if ('IntersectionObserver' in window) {
+                        const io = new IntersectionObserver((entries, obs) => {
+                            entries.forEach(en => { if (en.isIntersecting) { obs.unobserve(en.target); decode(en.target); } });
+                        }, { rootMargin: '300px' });
+                        imgs.forEach(img => io.observe(img));
+                    } else {
+                        imgs.forEach(decode);
+                    }
                 }
             };
             
@@ -289,9 +331,21 @@
                         if (msg.mms_media_path) {
                             const mediaUrl = `/api/media/${msg.mms_media_path}`;
                             if (msg.mms_media_type.startsWith('image/')) {
-                                contentHtml += `<div class="mb-2"><img src="${mediaUrl}" class="max-w-xs md:max-w-sm rounded-lg border border-gray-600 cursor-pointer" onclick="showImageModal('${mediaUrl}')"></div>`;
+                                if (/image\/hei[cf]/i.test(msg.mms_media_type)) {
+                                    // HEIC/HEIF: browsers can't render it. Emit a placeholder the
+                                    // hydrateHeic pass decodes client-side after insertion.
+                                    contentHtml += `<div class="mb-2"><img data-heic-src="${mediaUrl}" class="rounded-lg border border-gray-600 heic-pending" style="min-width:140px;min-height:100px;background:#374151" alt="Decoding HEIC…" title="Decoding HEIC…"></div>`;
+                                } else {
+                                    contentHtml += `<div class="mb-2"><img src="${mediaUrl}" class="max-w-xs md:max-w-sm rounded-lg border border-gray-600 cursor-pointer" onclick="showImageModal('${mediaUrl}')"></div>`;
+                                }
                             } else if (msg.mms_media_type.startsWith('video/')) {
-                                contentHtml += `<div class="mb-2"><video controls class="max-w-xs md:max-w-sm rounded-lg border border-gray-600"><source src="${mediaUrl}" type="${msg.mms_media_type}"></video></div>`;
+                                // iPhone .mov/.3gp hold H.264, which the browser can decode; they
+                                // only fail because their container MIME is rejected by name. Label
+                                // them video/mp4 so playback works with no transcode. The <a> inside
+                                // the <video> shows only when the browser truly can't play it (HEVC).
+                                const vtype = (msg.mms_media_type === 'video/quicktime' || msg.mms_media_type === 'video/3gpp')
+                                    ? 'video/mp4' : msg.mms_media_type;
+                                contentHtml += `<div class="mb-2"><video controls playsinline class="max-w-xs md:max-w-sm rounded-lg border border-gray-600"><source src="${mediaUrl}" type="${vtype}"><a href="${mediaUrl}" download class="text-blue-400 underline text-sm">Download video</a></video></div>`;
                             } else if (msg.mms_media_type.startsWith('audio/')) {
                                 contentHtml += `<div class="my-2"><audio controls src="${mediaUrl}" class="w-full"></audio></div>`;
                             }
@@ -308,7 +362,8 @@
                         wrapper.appendChild(bubble);
                         G.els.messageList.appendChild(wrapper);
                     });
-                    
+
+                    utils.hydrateHeic(G.els.messageList);
                     setTimeout(() => { G.els.messageList.scrollTop = G.els.messageList.scrollHeight; }, 0);
                 },
                 searchResults: (results) => {
@@ -379,6 +434,7 @@
                             <div>MMS Media: <strong class="text-white">${stats.total_mms_images.toLocaleString()}</strong></div>
                             ${stats.date_range ? `<div>Dates: <strong class="text-white">${stats.date_range}</strong></div>` : ''}
                             <div>DB Size: <strong class="text-white">${stats.db_size_mb} MB</strong></div>
+                            <div class="pt-2"><a href="/analytics" class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 font-semibold">📊 View Analytics</a></div>
                         `;
                     } catch (e) {
                         G.els.statsPanel.innerHTML = `<p class="text-red-400">Could not load stats.</p>`;
