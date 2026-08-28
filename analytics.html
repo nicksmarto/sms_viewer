@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Archive Analytics — SMS Backup Viewer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/vendor/echarts.min.js"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        .chart { width: 100%; }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 font-sans antialiased">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 py-6">
+        <!-- Header -->
+        <header class="flex items-center justify-between gap-4 mb-6">
+            <div>
+                <a href="/" class="text-sm text-gray-400 hover:text-blue-400">← Back to messages</a>
+                <h1 class="text-2xl font-bold text-white mt-1">Archive Analytics</h1>
+                <p class="text-sm text-gray-500">A ground-truth look at everything indexed in this cache.</p>
+            </div>
+            <div id="span-note" class="text-right text-xs text-gray-500 hidden sm:block"></div>
+        </header>
+
+        <!-- Loading / error -->
+        <div id="loading" class="text-center text-gray-500 py-20">Loading analytics…</div>
+        <div id="error" class="hidden text-center text-red-400 py-20"></div>
+
+        <div id="dashboard" class="hidden space-y-6">
+            <!-- KPI tiles -->
+            <section id="kpis" class="grid grid-cols-2 md:grid-cols-4 gap-3"></section>
+
+            <!-- Volume over time -->
+            <section class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div class="flex items-baseline justify-between flex-wrap gap-2">
+                    <h2 class="text-lg font-semibold text-white">Message volume over time</h2>
+                    <p class="text-xs text-gray-500">Bars are messages per month. <span class="text-red-400">Red bands</span> mark months with zero messages — likely gaps in the assembled cache.</p>
+                </div>
+                <div id="chart-volume" class="chart" style="height: 300px;"></div>
+            </section>
+
+            <!-- Constituent files -->
+            <section class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <h2 class="text-lg font-semibold text-white">Constituent backup files</h2>
+                <div id="files-banner" class="mt-2 mb-3 text-sm"></div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-gray-400 text-left border-b border-gray-700">
+                                <th class="py-2 pr-3 font-medium">File</th>
+                                <th class="py-2 px-3 font-medium">Date range</th>
+                                <th class="py-2 px-3 font-medium text-right">Size</th>
+                                <th class="py-2 px-3 font-medium text-right">Messages</th>
+                                <th class="py-2 px-3 font-medium text-right">MMS</th>
+                                <th class="py-2 px-3 font-medium text-right">Redundant</th>
+                                <th class="py-2 px-3 font-medium text-right">Only here</th>
+                                <th class="py-2 pl-3 font-medium">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="files-body"></tbody>
+                    </table>
+                </div>
+                <p class="text-xs text-gray-500 mt-3">
+                    <strong class="text-gray-400">Only here</strong> = messages found in no other file. A file with
+                    <strong class="text-gray-400">0</strong> is fully covered by others. <strong class="text-emerald-400">Safe to delete</strong>
+                    marks a set of files that can all be removed together with zero message or media loss — biased toward
+                    keeping fewer, larger files. This is advisory only; the app never touches your <code class="text-emerald-400">.xml</code> originals.
+                </p>
+            </section>
+
+            <!-- Two-up: top contacts + sent/received -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <section class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <h2 class="text-lg font-semibold text-white">Top conversations</h2>
+                    <div id="chart-contacts" class="chart" style="height: 360px;"></div>
+                </section>
+                <section class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <h2 class="text-lg font-semibold text-white">Sent vs received</h2>
+                    <div id="chart-sr" class="chart" style="height: 170px;"></div>
+                    <div id="chart-sr-year" class="chart" style="height: 170px;"></div>
+                </section>
+            </div>
+
+            <!-- Activity heatmap -->
+            <section class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <h2 class="text-lg font-semibold text-white">When you text</h2>
+                <p class="text-xs text-gray-500">Messages by day of week and hour of day (your local time).</p>
+                <div id="chart-heatmap" class="chart" style="height: 280px;"></div>
+            </section>
+        </div>
+    </div>
+
+    <script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const AXIS = '#9ca3af', GRID = '#374151', BLUE = '#3b82f6', EMER = '#34d399';
+        const WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const charts = [];
+
+        const fmtNum = (n) => (n || 0).toLocaleString();
+        function fmtBytes(b) {
+            b = b || 0;
+            if (b < 1024) return b + ' B';
+            const u = ['KB', 'MB', 'GB', 'TB'];
+            let i = -1;
+            do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+            return b.toFixed(b < 10 ? 1 : 0) + ' ' + u[i];
+        }
+        const baseGrid = { left: 8, right: 20, top: 20, bottom: 40, containLabel: true };
+
+        function tile(label, value, sub) {
+            const el = document.createElement('div');
+            el.className = 'bg-gray-800 rounded-lg p-4 border border-gray-700';
+            el.innerHTML = `<div class="text-2xl font-bold text-white">${value}</div>
+                <div class="text-xs text-gray-400 mt-1">${label}</div>
+                ${sub ? `<div class="text-xs text-gray-500 mt-0.5">${sub}</div>` : ''}`;
+            return el;
+        }
+
+        function renderKpis(d) {
+            const totalMsgs = (d.yearly || []).reduce((a, y) => a + y.count, 0);
+            const span = d.histogram.length ? `${d.histogram[0].month} → ${d.histogram[d.histogram.length - 1].month}` : '—';
+            $('span-note').textContent = span + ' • ' + d.histogram.length + ' months';
+            const k = $('kpis');
+            k.appendChild(tile('Total messages', fmtNum(totalMsgs)));
+            k.appendChild(tile('Media files', fmtNum(d.records.total_media)));
+            k.appendChild(tile('Busiest day', fmtNum(d.records.busiest_day_count), d.records.busiest_day));
+            k.appendChild(tile('Cache on disk', fmtBytes(d.records.db_bytes + d.records.media_bytes),
+                `DB ${fmtBytes(d.records.db_bytes)} • media ${fmtBytes(d.records.media_bytes)}`));
+        }
+
+        function zeroBands(hist) {
+            // Contiguous runs of zero-count months -> markArea pairs (by category).
+            const areas = [];
+            let start = null;
+            for (let i = 0; i < hist.length; i++) {
+                const zero = hist[i].count === 0;
+                if (zero && start === null) start = i;
+                if ((!zero || i === hist.length - 1) && start !== null) {
+                    const end = zero ? i : i - 1;
+                    areas.push([{ xAxis: hist[start].month }, { xAxis: hist[end].month }]);
+                    start = null;
+                }
+            }
+            return areas;
+        }
+
+        function renderVolume(d) {
+            const c = echarts.init($('chart-volume'), null, { renderer: 'canvas' });
+            charts.push(c);
+            const months = d.histogram.map((h) => h.month);
+            const counts = d.histogram.map((h) => h.count);
+            c.setOption({
+                backgroundColor: 'transparent',
+                textStyle: { color: AXIS },
+                tooltip: { trigger: 'axis' },
+                grid: baseGrid,
+                xAxis: {
+                    type: 'category', data: months,
+                    axisLine: { lineStyle: { color: GRID } },
+                    axisLabel: { color: AXIS, formatter: (v) => v.endsWith('-01') ? v.slice(0, 4) : '' },
+                    axisTick: { show: false },
+                },
+                yAxis: {
+                    type: 'value', splitLine: { lineStyle: { color: GRID } },
+                    axisLabel: { color: AXIS },
+                },
+                series: [{
+                    type: 'bar', data: counts, itemStyle: { color: BLUE }, barMaxWidth: 14,
+                    markArea: {
+                        silent: true, itemStyle: { color: 'rgba(248,113,113,0.16)' },
+                        data: zeroBands(d.histogram),
+                    },
+                }],
+            });
+        }
+
+        function renderContacts(d) {
+            const c = echarts.init($('chart-contacts'), null, { renderer: 'canvas' });
+            charts.push(c);
+            const rows = (d.top_contacts || []).slice().reverse();
+            c.setOption({
+                backgroundColor: 'transparent',
+                textStyle: { color: AXIS },
+                tooltip: {
+                    trigger: 'axis', axisPointer: { type: 'shadow' },
+                    formatter: (p) => `${rows[p[0].dataIndex].label}<br/><strong>${fmtNum(p[0].value)}</strong> messages`,
+                },
+                grid: { left: 10, right: 30, top: 10, bottom: 20, containLabel: true },
+                xAxis: { type: 'value', splitLine: { lineStyle: { color: GRID } }, axisLabel: { color: AXIS } },
+                yAxis: {
+                    type: 'category',
+                    data: rows.map((r) => r.label.length > 22 ? r.label.slice(0, 21) + '…' : r.label),
+                    axisLine: { lineStyle: { color: GRID } }, axisLabel: { color: AXIS },
+                },
+                series: [{ type: 'bar', data: rows.map((r) => r.count), itemStyle: { color: BLUE, borderRadius: [0, 3, 3, 0] } }],
+            });
+        }
+
+        function renderSentReceived(d) {
+            const sr = d.sent_received || { sent: 0, received: 0, by_year: [] };
+            const donut = echarts.init($('chart-sr'), null, { renderer: 'canvas' });
+            charts.push(donut);
+            donut.setOption({
+                backgroundColor: 'transparent',
+                textStyle: { color: AXIS },
+                tooltip: { trigger: 'item', formatter: (p) => `${p.name}: <strong>${fmtNum(p.value)}</strong> (${p.percent}%)` },
+                legend: { textStyle: { color: AXIS }, bottom: 0 },
+                series: [{
+                    type: 'pie', radius: ['45%', '70%'], center: ['50%', '45%'],
+                    label: { show: false }, data: [
+                        { name: 'Sent', value: sr.sent, itemStyle: { color: BLUE } },
+                        { name: 'Received', value: sr.received, itemStyle: { color: '#64748b' } },
+                    ],
+                }],
+            });
+            const years = (sr.by_year || []).map((y) => y.year);
+            const byYear = echarts.init($('chart-sr-year'), null, { renderer: 'canvas' });
+            charts.push(byYear);
+            byYear.setOption({
+                backgroundColor: 'transparent',
+                textStyle: { color: AXIS },
+                tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                legend: { show: false },
+                grid: { left: 8, right: 12, top: 12, bottom: 24, containLabel: true },
+                xAxis: { type: 'category', data: years, axisLine: { lineStyle: { color: GRID } }, axisLabel: { color: AXIS } },
+                yAxis: { type: 'value', splitLine: { lineStyle: { color: GRID } }, axisLabel: { color: AXIS } },
+                series: [
+                    { name: 'Sent', type: 'bar', stack: 't', data: (sr.by_year || []).map((y) => y.sent), itemStyle: { color: BLUE } },
+                    { name: 'Received', type: 'bar', stack: 't', data: (sr.by_year || []).map((y) => y.received), itemStyle: { color: '#64748b' } },
+                ],
+            });
+        }
+
+        function renderHeatmap(d) {
+            const c = echarts.init($('chart-heatmap'), null, { renderer: 'canvas' });
+            charts.push(c);
+            const data = [];
+            let max = 0;
+            for (let dow = 0; dow < 7; dow++) {
+                for (let hr = 0; hr < 24; hr++) {
+                    const v = (d.heatmap[dow] || [])[hr] || 0;
+                    if (v > max) max = v;
+                    data.push([hr, dow, v]);
+                }
+            }
+            c.setOption({
+                backgroundColor: 'transparent',
+                textStyle: { color: AXIS },
+                tooltip: { formatter: (p) => `${WEEK[p.value[1]]} ${String(p.value[0]).padStart(2, '0')}:00<br/><strong>${fmtNum(p.value[2])}</strong> messages` },
+                grid: { left: 44, right: 16, top: 10, bottom: 60 },
+                xAxis: {
+                    type: 'category', data: Array.from({ length: 24 }, (_, i) => i),
+                    splitArea: { show: true }, axisLabel: { color: AXIS, interval: 1 }, axisLine: { lineStyle: { color: GRID } },
+                },
+                yAxis: {
+                    type: 'category', data: WEEK, splitArea: { show: true },
+                    axisLabel: { color: AXIS }, axisLine: { lineStyle: { color: GRID } },
+                },
+                visualMap: {
+                    min: 0, max: max || 1, calculable: true, orient: 'horizontal', left: 'center', bottom: 6,
+                    textStyle: { color: AXIS }, inRange: { color: ['#111827', '#1e3a8a', '#3b82f6', '#93c5fd'] },
+                },
+                series: [{ type: 'heatmap', data, emphasis: { itemStyle: { borderColor: '#fff', borderWidth: 1 } } }],
+            });
+        }
+
+        function renderFiles(d) {
+            const s = d.files_summary || {};
+            const banner = $('files-banner');
+            if (s.safe_to_delete_count > 0) {
+                banner.innerHTML = `<div class="rounded-md bg-emerald-900/40 border border-emerald-700 text-emerald-200 px-3 py-2">
+                    <strong>${s.safe_to_delete_count}</strong> of ${s.total_files} files
+                    (${fmtBytes(s.reclaimable_bytes)}) are fully covered by others and can be deleted with
+                    <strong>zero</strong> message or media loss.</div>`;
+            } else {
+                banner.innerHTML = `<div class="rounded-md bg-gray-700/40 border border-gray-600 text-gray-300 px-3 py-2">
+                    No files are fully redundant — every file contributes at least one message found nowhere else.</div>`;
+            }
+            // Overlap lookup: file id -> [{other id, shared}]
+            const ov = {};
+            (d.overlap || []).forEach((o) => {
+                (ov[o.file_a] = ov[o.file_a] || []).push({ id: o.file_b, shared: o.shared_count });
+                (ov[o.file_b] = ov[o.file_b] || []).push({ id: o.file_a, shared: o.shared_count });
+            });
+            const nameById = {};
+            d.files.forEach((f) => { nameById[f.id] = f.filename; });
+
+            const body = $('files-body');
+            d.files.forEach((f) => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-b border-gray-700/50 hover:bg-gray-700/30 cursor-pointer';
+                const status = f.safe_to_delete
+                    ? '<span class="inline-block px-2 py-0.5 rounded-full text-xs bg-emerald-900/60 text-emerald-300 border border-emerald-700">Safe to delete</span>'
+                    : '<span class="inline-block px-2 py-0.5 rounded-full text-xs bg-gray-700 text-gray-300">Keep</span>';
+                tr.innerHTML = `
+                    <td class="py-2 pr-3 text-gray-200 max-w-xs truncate" title="${f.filename}">${f.filename}</td>
+                    <td class="py-2 px-3 text-gray-400 whitespace-nowrap">${f.date_range || '—'}</td>
+                    <td class="py-2 px-3 text-right text-gray-300 whitespace-nowrap">${fmtBytes(f.size_bytes)}</td>
+                    <td class="py-2 px-3 text-right text-gray-300">${fmtNum(f.msg_count)}</td>
+                    <td class="py-2 px-3 text-right text-gray-400">${fmtNum(f.mms_count)}</td>
+                    <td class="py-2 px-3 text-right text-gray-400">${f.redundant_pct}%</td>
+                    <td class="py-2 px-3 text-right ${f.unique_only_count === 0 ? 'text-emerald-400' : 'text-gray-200'}">${fmtNum(f.unique_only_count)}</td>
+                    <td class="py-2 pl-3">${status}</td>`;
+                const detail = document.createElement('tr');
+                detail.className = 'hidden bg-gray-900/40';
+                const others = (ov[f.id] || []).sort((a, b) => b.shared - a.shared);
+                const list = others.length
+                    ? others.map((o) => `${nameById[o.id] || ('file ' + o.id)} <span class="text-gray-500">(${fmtNum(o.shared)} shared)</span>`).join(' · ')
+                    : 'No messages shared with any other file.';
+                detail.innerHTML = `<td colspan="8" class="px-3 py-2 text-xs text-gray-400"><strong class="text-gray-300">Overlaps with:</strong> ${list}</td>`;
+                tr.addEventListener('click', () => detail.classList.toggle('hidden'));
+                body.appendChild(tr);
+                body.appendChild(detail);
+            });
+        }
+
+        async function load() {
+            try {
+                const res = await fetch('/api/analytics');
+                const d = await res.json();
+                if (!res.ok || d.error) throw new Error(d.error || ('HTTP ' + res.status));
+                if (!d.histogram || !d.histogram.length) {
+                    $('loading').classList.add('hidden');
+                    $('error').textContent = 'No indexed messages found. Open the viewer and index an archive first.';
+                    $('error').classList.remove('hidden');
+                    return;
+                }
+                $('loading').classList.add('hidden');
+                $('dashboard').classList.remove('hidden');
+                renderKpis(d);
+                renderVolume(d);
+                renderFiles(d);
+                renderContacts(d);
+                renderSentReceived(d);
+                renderHeatmap(d);
+            } catch (e) {
+                $('loading').classList.add('hidden');
+                $('error').textContent = 'Could not load analytics: ' + e.message;
+                $('error').classList.remove('hidden');
+            }
+        }
+
+        window.addEventListener('resize', () => charts.forEach((c) => c.resize()));
+        load();
+    })();
+    </script>
+</body>
+</html>
