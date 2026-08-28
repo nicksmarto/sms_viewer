@@ -365,6 +365,24 @@ class TestUniqueHashIdentity(unittest.TestCase):
         self.assertIsInstance(generate_unique_hash({'participants': 'X', 'date': '', 'body': 'hi', 'type': '1'}), str)
         self.assertIsInstance(generate_unique_hash({'participants': 'X', 'date': None, 'body': 'hi', 'type': '1'}), str)
 
+    def test_edge_whitespace_in_body_is_ignored(self):
+        # iMessage kept a trailing space ('recommendations '); the Android copy
+        # did not. Same logical message => same identity.
+        base = {'participants': 'X', 'date': 1552428431000, 'type': '1'}
+        self.assertEqual(
+            generate_unique_hash({**base, 'body': 'recommendations '}),
+            generate_unique_hash({**base, 'body': 'recommendations'}),
+        )
+
+    def test_interior_whitespace_still_differentiates(self):
+        # Only EDGE whitespace is ignored; interior text stays significant so
+        # two genuinely different messages are never merged.
+        base = {'participants': 'X', 'date': 1552428431000, 'type': '1'}
+        self.assertNotEqual(
+            generate_unique_hash({**base, 'body': 'a b'}),
+            generate_unique_hash({**base, 'body': 'ab'}),
+        )
+
 
 class TestCleanMessageText(unittest.TestCase):
     """U+FFFC is iMessage's inline-attachment placeholder; left in, it renders
@@ -431,6 +449,33 @@ class TestCrossSourceDeduplication(_CraftedIndexBase):
         })
         rows = self.query("SELECT COUNT(*) FROM messages WHERE body='dup me'")
         self.assertEqual(rows[0][0], 1, "Sub-second-apart copies of one message were not de-duplicated.")
+
+    def test_trailing_whitespace_body_difference_collapses(self):
+        """The same message exported by iMessage (a trailing space in the body)
+        and by Android SMS Backup & Restore (no trailing space), landing in the
+        same second, must collapse to a single row."""
+        self.index({
+            'imessage.xml': '<smses><sms address="+13155588881" date="1552428431000" '
+                            'type="1" body="native foods " readable_date="Mar 12, 2019 04:07:11 PM"/></smses>',
+            'android.xml': '<smses><sms address="3155588881" date="1552428431149" '
+                           'type="1" body="native foods" readable_date="Mar 12, 2019 16:07:11"/></smses>',
+        })
+        rows = self.query("SELECT COUNT(*) FROM messages WHERE body LIKE 'native foods%'")
+        self.assertEqual(rows[0][0], 1, "Trailing-whitespace-only body difference was not de-duplicated.")
+
+    def test_sms_and_mms_textpart_of_same_message_collapse(self):
+        """The same message stored as a plain <sms> in one archive and as an
+        <mms> text part in another (same second, body, participants, direction)
+        must collapse to a single row — they used to hash 'sms' vs 'text'."""
+        self.index({
+            'android_sms.xml': '<smses><sms address="+13155588881" date="1538154665000" '
+                               'type="1" body="Some grass and soybeans"/></smses>',
+            'imessage_mms.xml': '<smses><mms date="1538154665000" msg_box="1" address="3155588881" m_type="132">'
+                                '<parts><part seq="0" ct="text/plain" text="Some grass and soybeans"/></parts>'
+                                '<addrs><addr address="3155588881" type="137"/></addrs></mms></smses>',
+        })
+        rows = self.query("SELECT COUNT(*) FROM messages WHERE body LIKE 'Some grass%'")
+        self.assertEqual(rows[0][0], 1, "SMS vs MMS-text-part copies of one message were not de-duplicated.")
 
 
 class TestAttachmentPlaceholderIngest(_CraftedIndexBase):
@@ -530,6 +575,74 @@ class TestMediaMimeOverride(_CraftedIndexBase):
         resp = self._fetch('%.jpeg')
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.headers['Content-Type'].startswith('image/jpeg'))
+
+
+class TestDateRangeFilter(_CraftedIndexBase):
+    """Optional start/end (epoch-ms) filtering across the data endpoints, the
+    /api/volume histogram, and /api/stats raw bounds. Uses fixed UTC anchors."""
+    T2015 = 1433116800000  # 2015-06-01T00:00:00Z
+    T2020 = 1590969600000  # 2020-06-01T00:00:00Z
+    T2024 = 1717200000000  # 2024-06-01T00:00:00Z
+    Y2020 = (1577836800000, 1609459199000)  # all of 2020 (UTC)
+    Y2015 = (1420070400000, 1451606399000)  # all of 2015 (UTC)
+
+    def setUp(self):
+        super().setUp()
+        self.index({'s.xml':
+            '<smses>'
+            f'<sms address="+15551110000" date="{self.T2015}" type="1" body="alpha fifteen"/>'
+            f'<sms address="+15551110001" date="{self.T2020}" type="1" body="bravo twenty"/>'
+            f'<sms address="+15551110002" date="{self.T2024}" type="1" body="charlie four"/>'
+            '</smses>'})
+        self.client = app.test_client()
+
+    def test_stats_exposes_raw_bounds(self):
+        d = self.client.get('/api/stats').get_json()
+        self.assertEqual(d['date_min'], self.T2015)
+        self.assertEqual(d['date_max'], self.T2024)
+
+    def test_volume_bounds_and_total(self):
+        d = self.client.get('/api/volume').get_json()
+        self.assertEqual(d['min_ms'], self.T2015)
+        self.assertEqual(d['max_ms'], self.T2024)
+        self.assertEqual(sum(b['c'] for b in d['buckets']), 3)
+
+    def test_conversations_unfiltered_shows_all(self):
+        self.assertEqual(len(self.client.get('/api/conversations').get_json()), 3)
+
+    def test_conversations_filtered_to_one_year(self):
+        s, e = self.Y2020
+        d = self.client.get('/api/conversations', query_string={'start': s, 'end': e}).get_json()
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0]['address'], '5551110001')
+        self.assertTrue(s <= d[0]['last_message_date'] <= e)
+
+    def test_messages_filtered(self):
+        pid = '5551110001'
+        self.assertEqual(len(self.client.get(f'/api/messages/{pid}').get_json()), 1)
+        s, e = self.Y2015
+        self.assertEqual(len(self.client.get(f'/api/messages/{pid}', query_string={'start': s, 'end': e}).get_json()), 0)
+        s, e = self.Y2020
+        self.assertEqual(len(self.client.get(f'/api/messages/{pid}', query_string={'start': s, 'end': e}).get_json()), 1)
+
+    def test_search_word_respects_range(self):
+        full = self.client.get('/api/search', query_string={'q': 'bravo'}).get_json()
+        self.assertEqual(len(full['messages']), 1)  # 'bravo' only in the 2020 message
+        s, e = self.Y2015
+        out = self.client.get('/api/search', query_string={'q': 'bravo', 'start': s, 'end': e}).get_json()
+        self.assertEqual(len(out['messages']), 0)
+        self.assertEqual(len(out['conversations']), 0)
+
+    def test_search_number_respects_range(self):
+        s, e = self.Y2020
+        yes = self.client.get('/api/search', query_string={'q': '5551110001', 'start': s, 'end': e}).get_json()
+        self.assertTrue(any(c['address'] == '5551110001' for c in yes['conversations']))
+        s, e = self.Y2015
+        no = self.client.get('/api/search', query_string={'q': '5551110001', 'start': s, 'end': e}).get_json()
+        self.assertFalse(any(c['address'] == '5551110001' for c in no['conversations']))
+
+    def test_current_directory_reports_configured(self):
+        self.assertTrue(self.client.get('/api/current-directory').get_json()['configured'])
 
 
 if __name__ == '__main__':
