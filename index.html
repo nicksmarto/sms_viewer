@@ -7,6 +7,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Vendored libheif (WASM) — decodes HEIC/HEIF images the browser can't render, client-side. -->
     <script src="/vendor/heic2any.min.js"></script>
+    <!-- Vendored Apache ECharts — powers the date-range "volume scrubber". -->
+    <script src="/vendor/echarts.min.js"></script>
     <style>
         /* Simple scrollbar styling */
         ::-webkit-scrollbar { width: 8px; }
@@ -76,7 +78,25 @@
                     </div>
                     <button id="mark-spam-btn" class="hidden flex-shrink-0 text-xs bg-gray-700 hover:bg-red-800 text-white font-semibold py-1.5 px-3 rounded transition-colors" title="Add this conversation's number to the spam list">🚫 Mark as spam</button>
                 </header>
-                
+
+                <!-- Date-range "volume scrubber": drag the handles to bound the view by time. -->
+                <div id="scrubber-bar" class="hidden flex-shrink-0 border-b border-gray-700 bg-gray-900 px-4 pt-2 pb-1">
+                    <div class="flex items-center justify-between gap-3 flex-wrap mb-1">
+                        <div class="flex items-center gap-2 text-xs text-gray-400">
+                            <input type="date" id="range-start" class="bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-gray-200 focus:ring-1 focus:ring-blue-500 focus:outline-none">
+                            <span class="text-gray-600">→</span>
+                            <input type="date" id="range-end" class="bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-gray-200 focus:ring-1 focus:ring-blue-500 focus:outline-none">
+                            <span id="range-count" class="ml-1 text-gray-500"></span>
+                        </div>
+                        <div class="flex items-center gap-1 text-xs">
+                            <button data-preset="thisyear" class="range-preset bg-gray-700 hover:bg-gray-600 text-gray-200 rounded px-2 py-0.5">This year</button>
+                            <button data-preset="lastyear" class="range-preset bg-gray-700 hover:bg-gray-600 text-gray-200 rounded px-2 py-0.5">Last year</button>
+                            <button data-preset="all" class="range-preset bg-gray-700 hover:bg-gray-600 text-gray-200 rounded px-2 py-0.5">All</button>
+                        </div>
+                    </div>
+                    <div id="scrubber-chart" style="height: 60px;"></div>
+                </div>
+
                 <div id="message-list" class="flex-grow overflow-y-auto p-4 md:p-6 space-y-4">
                     <div id="placeholder" class="h-full flex items-center justify-center text-gray-500">
                         <div class="text-center">
@@ -152,6 +172,11 @@
                     currentContact: document.getElementById('current-contact'),
                     currentNumber: document.getElementById('current-number'),
                     statsPanel: document.getElementById('stats-panel'),
+                    scrubberBar: document.getElementById('scrubber-bar'),
+                    scrubberChart: document.getElementById('scrubber-chart'),
+                    rangeStart: document.getElementById('range-start'),
+                    rangeEnd: document.getElementById('range-end'),
+                    rangeCount: document.getElementById('range-count'),
                     rebuildIndexBtn: document.getElementById('rebuild-index-btn'),
                     exportMediaBtn: document.getElementById('export-media-btn'),
                     searchInput: document.getElementById('search-input'),
@@ -183,6 +208,11 @@
                     isSearching: false,
                     currentAddress: null,
                     currentName: null,
+                    // Date-range scrubber
+                    rangeStart: null, rangeEnd: null,   // active range, epoch ms
+                    fullMin: null, fullMax: null,       // archive's full span, epoch ms
+                    scrubberChart: null, scrubberReady: false,
+                    zoomTimeout: null, lastAppliedKey: null,
                 }
             };
 
@@ -229,6 +259,20 @@
                     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
                     const i = Math.floor(Math.log(n) / Math.log(1024));
                     return `${(n / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`;
+                },
+                // Epoch ms <-> the 'YYYY-MM-DD' a <input type="date"> expects (local time).
+                msToInputDate: (ms) => {
+                    if (ms == null) return '';
+                    const d = new Date(ms);
+                    const p = (n) => String(n).padStart(2, '0');
+                    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+                },
+                inputDateToMs: (s, endOfDay = false) => {
+                    if (!s) return null;
+                    const [y, m, d] = s.split('-').map(Number);
+                    if (!y || !m || !d) return null;
+                    return endOfDay ? new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+                                    : new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
                 },
                 // Decode HEIC/HEIF <img data-heic-src> placeholders to viewable
                 // JPEGs in the browser via the vendored heic2any (libheif WASM).
@@ -405,8 +449,11 @@
             const actions = {
                 loadInitialData: async () => {
                     try {
-                        const conversations = await api.get('/api/conversations');
+                        await actions.ensureScrubber();
+                        const rp = actions.rangeParams();
+                        const conversations = await api.get('/api/conversations' + (rp ? `?${rp}` : ''));
                         render.conversations(conversations);
+                        actions.updateRangeCount(conversations);
                         await actions.updateStats();
                     } catch (error) {
                         console.error('Failed to load initial data:', error);
@@ -414,7 +461,8 @@
                 },
                 loadMessages: async (conversationId, conversationName) => {
                     try {
-                        const messages = await api.get(`/api/messages/${conversationId}`);
+                        const rp = actions.rangeParams();
+                        const messages = await api.get(`/api/messages/${conversationId}` + (rp ? `?${rp}` : ''));
                         render.messages(messages, conversationName);
                         G.state.currentAddress = conversationId;
                         G.state.currentName = conversationName;
@@ -440,6 +488,151 @@
                         G.els.statsPanel.innerHTML = `<p class="text-red-400">Could not load stats.</p>`;
                     }
                 },
+
+                // ----- Date-range "volume scrubber" -----------------------------
+                isFullRange: () => {
+                    const s = G.state;
+                    if (s.rangeStart == null || s.rangeEnd == null) return true;
+                    return (s.fullMin == null || s.rangeStart <= s.fullMin) &&
+                           (s.fullMax == null || s.rangeEnd >= s.fullMax);
+                },
+                rangeParams: () => {
+                    if (actions.isFullRange()) return '';
+                    return `start=${Math.floor(G.state.rangeStart)}&end=${Math.ceil(G.state.rangeEnd)}`;
+                },
+                rangeKey: () => `${G.state.isSearching}|${Math.floor(G.state.rangeStart ?? 0)}|${Math.ceil(G.state.rangeEnd ?? 0)}`,
+                persistRange: () => {
+                    try {
+                        if (actions.isFullRange()) localStorage.removeItem('smsviewer.range');
+                        else localStorage.setItem('smsviewer.range', JSON.stringify({ start: G.state.rangeStart, end: G.state.rangeEnd }));
+                    } catch (_) { /* private mode / storage disabled */ }
+                },
+                syncRangeInputs: () => {
+                    if (G.els.rangeStart) G.els.rangeStart.value = utils.msToInputDate(G.state.rangeStart);
+                    if (G.els.rangeEnd) G.els.rangeEnd.value = utils.msToInputDate(G.state.rangeEnd);
+                },
+                updateRangeCount: (conversations) => {
+                    if (!G.els.rangeCount) return;
+                    const total = (conversations || []).reduce((a, c) => a + (c.message_count || 0), 0);
+                    const suffix = actions.isFullRange() ? '' : ' in range';
+                    G.els.rangeCount.textContent = `${total.toLocaleString()} messages${suffix}`;
+                },
+                ensureScrubber: async (force = false) => {
+                    if (typeof echarts === 'undefined') return;      // vendored lib missing — degrade
+                    if (G.state.scrubberReady && !force) return;     // built once; skip re-fetch
+                    let vol;
+                    try { vol = await api.get('/api/volume'); } catch (e) { return; }
+                    if (!vol || vol.min_ms == null || !vol.buckets || !vol.buckets.length) {
+                        G.els.scrubberBar.classList.add('hidden');
+                        return;
+                    }
+                    G.state.fullMin = vol.min_ms;
+                    G.state.fullMax = vol.max_ms;
+                    G.els.scrubberBar.classList.remove('hidden');
+
+                    // Determine the active range: keep current (re-clamped) on a rebuild,
+                    // else restore any saved range, else the full span.
+                    const clamp = (v, d) => (v == null ? d : Math.max(vol.min_ms, Math.min(v, vol.max_ms)));
+                    let s = vol.min_ms, e = vol.max_ms;
+                    if (G.state.scrubberReady) {
+                        s = clamp(G.state.rangeStart, vol.min_ms);
+                        e = clamp(G.state.rangeEnd, vol.max_ms);
+                    } else {
+                        try {
+                            const saved = JSON.parse(localStorage.getItem('smsviewer.range') || 'null');
+                            if (saved && typeof saved.start === 'number' && typeof saved.end === 'number') {
+                                s = clamp(saved.start, vol.min_ms); e = clamp(saved.end, vol.max_ms);
+                            }
+                        } catch (_) {}
+                    }
+                    if (!(s < e)) { s = vol.min_ms; e = vol.max_ms; }
+                    G.state.rangeStart = s; G.state.rangeEnd = e;
+                    // Pre-seed the applied key so the echoed 'datazoom' from setup is a no-op.
+                    G.state.lastAppliedKey = actions.rangeKey();
+
+                    const data = vol.buckets.map(b => [b.t, b.c]);
+                    if (!G.state.scrubberChart) {
+                        const chart = echarts.init(G.els.scrubberChart, null, { renderer: 'canvas' });
+                        G.state.scrubberChart = chart;
+                        chart.setOption({
+                            backgroundColor: 'transparent',
+                            grid: { left: 6, right: 6, top: 2, height: 6 },
+                            xAxis: { type: 'time', min: vol.min_ms, max: vol.max_ms, show: false },
+                            yAxis: { type: 'value', show: false },
+                            tooltip: {
+                                trigger: 'axis',
+                                formatter: (p) => {
+                                    const d = new Date(p[0].value[0]);
+                                    return `${d.toLocaleDateString('default', { month: 'short', year: 'numeric' })}: <strong>${(p[0].value[1] || 0).toLocaleString()}</strong>`;
+                                },
+                            },
+                            dataZoom: [{
+                                type: 'slider', xAxisIndex: 0, filterMode: 'none',
+                                startValue: s, endValue: e, top: 4, height: 48,
+                                backgroundColor: 'transparent', borderColor: 'transparent',
+                                dataBackground: { lineStyle: { color: '#3b82f6', opacity: 0.5 }, areaStyle: { color: 'rgba(59,130,246,0.25)' } },
+                                selectedDataBackground: { lineStyle: { color: '#60a5fa' }, areaStyle: { color: 'rgba(96,165,250,0.55)' } },
+                                fillerColor: 'rgba(59,130,246,0.12)',
+                                handleStyle: { color: '#93c5fd', borderColor: '#93c5fd' },
+                                moveHandleStyle: { color: '#3b82f6' },
+                                textStyle: { color: '#9ca3af', fontSize: 10 },
+                                labelFormatter: (v) => new Date(v).toLocaleDateString('default', { month: 'short', year: 'numeric' }),
+                            }],
+                            // Main series is invisible; the dataZoom slider renders the
+                            // histogram preview from this data. Keeps the control compact.
+                            series: [{ type: 'bar', data, itemStyle: { color: 'rgba(0,0,0,0)' }, silent: true, large: true }],
+                        });
+                        chart.on('datazoom', () => {
+                            clearTimeout(G.state.zoomTimeout);
+                            G.state.zoomTimeout = setTimeout(() => {
+                                const dz = chart.getOption().dataZoom[0];
+                                const span = (G.state.fullMax - G.state.fullMin) || 1;
+                                G.state.rangeStart = Math.round(G.state.fullMin + span * (dz.start || 0) / 100);
+                                G.state.rangeEnd = Math.round(G.state.fullMin + span * (dz.end == null ? 100 : dz.end) / 100);
+                                actions.syncRangeInputs();
+                                actions.persistRange();
+                                actions.applyDateFilter();
+                            }, 250);
+                        });
+                        G.state.scrubberReady = true;
+                    } else {
+                        // Rebuild after re-index: refresh data/bounds and move handles.
+                        G.state.scrubberChart.setOption({
+                            xAxis: { min: vol.min_ms, max: vol.max_ms },
+                            series: [{ data }],
+                            dataZoom: [{ startValue: s, endValue: e }],
+                        });
+                    }
+                    actions.syncRangeInputs();
+                },
+                setRange: (startMs, endMs) => {
+                    const { fullMin, fullMax } = G.state;
+                    if (fullMin == null || fullMax == null) return;
+                    startMs = Math.max(fullMin, Math.min(startMs, fullMax));
+                    endMs = Math.max(fullMin, Math.min(endMs, fullMax));
+                    if (!(startMs < endMs)) { startMs = fullMin; endMs = fullMax; }
+                    G.state.rangeStart = startMs; G.state.rangeEnd = endMs;
+                    if (G.state.scrubberChart) {
+                        // Fires 'datazoom' → the debounced handler runs applyDateFilter.
+                        G.state.scrubberChart.dispatchAction({ type: 'dataZoom', startValue: startMs, endValue: endMs });
+                    }
+                    actions.syncRangeInputs();
+                    actions.persistRange();
+                    actions.applyDateFilter();
+                },
+                applyDateFilter: async () => {
+                    const key = actions.rangeKey();
+                    if (key === G.state.lastAppliedKey) return;   // dedupe echoed/no-op changes
+                    G.state.lastAppliedKey = key;
+                    if (G.state.isSearching) {
+                        await actions.handleSearch();
+                    } else {
+                        await actions.loadInitialData();
+                        if (G.state.currentAddress) {
+                            await actions.loadMessages(G.state.currentAddress, G.state.currentName);
+                        }
+                    }
+                },
                 startIndexing: async (rebuild = false) => {
                     try {
                         await api.post('/api/start-indexing', { rebuild });
@@ -458,6 +651,7 @@
                             if (!status.running) {
                                 clearInterval(interval);
                                 utils.showIndexingOverlay(false);
+                                await actions.ensureScrubber(true);   // rebuild histogram with new data
                                 actions.loadInitialData();
                                 G.els.rebuildIndexBtn.disabled = false;
                                 G.els.rebuildIndexBtn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -658,9 +852,14 @@
                     
                     G.state.isSearching = true;
                     try {
-                        const results = await api.get(`/api/search?q=${encodeURIComponent(query)}`);
+                        const rp = actions.rangeParams();
+                        const results = await api.get(`/api/search?q=${encodeURIComponent(query)}` + (rp ? `&${rp}` : ''));
                         render.conversations(results.conversations);
                         render.searchResults(results.messages);
+                        if (G.els.rangeCount) {
+                            const n = (results.messages || []).length;
+                            G.els.rangeCount.textContent = `${n}${n === 100 ? '+' : ''} matches`;
+                        }
                     } catch (error) {
                         console.error('Search failed:', error);
                         G.els.messageList.innerHTML = `<div class="text-center text-red-400">Search failed.</div>`;
@@ -766,6 +965,43 @@
                     G.els.spamModal.classList.add('hidden');
                 }
             });
+
+            // --- Date-range scrubber controls ---
+            G.els.rangeStart.addEventListener('change', () => {
+                const s = utils.inputDateToMs(G.els.rangeStart.value, false);
+                if (s != null) actions.setRange(s, G.state.rangeEnd);
+                else actions.syncRangeInputs();
+            });
+            G.els.rangeEnd.addEventListener('change', () => {
+                const e = utils.inputDateToMs(G.els.rangeEnd.value, true);
+                if (e != null) actions.setRange(G.state.rangeStart, e);
+                else actions.syncRangeInputs();
+            });
+            document.querySelectorAll('.range-preset').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (G.state.fullMin == null) return;
+                    const preset = btn.dataset.preset;
+                    if (preset === 'all') { actions.setRange(G.state.fullMin, G.state.fullMax); return; }
+                    const now = new Date();
+                    const yr = now.getFullYear() - (preset === 'lastyear' ? 1 : 0);
+                    actions.setRange(new Date(yr, 0, 1).getTime(), new Date(yr, 11, 31, 23, 59, 59, 999).getTime());
+                });
+            });
+            window.addEventListener('resize', () => { if (G.state.scrubberChart) G.state.scrubberChart.resize(); });
+
+            // On load, if the server already has an archive selected (e.g. when
+            // returning from /analytics), skip the folder picker and go straight
+            // to the viewer instead of forcing a re-pick.
+            (async () => {
+                try {
+                    const cur = await api.get('/api/current-directory');
+                    if (cur && cur.configured) {
+                        G.els.modalContainer.classList.add('hidden');
+                        G.els.mainUI.classList.remove('hidden');
+                        await actions.handleCacheStatus(cur.cache || { status: 'ready' });
+                    }
+                } catch (_) { /* leave the folder picker showing */ }
+            })();
         });
     </script>
 </body>

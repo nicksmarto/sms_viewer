@@ -38,7 +38,14 @@ DB_NAME = 'sms_messages.db'
 #     that de-duplication drops) so the dashboard can report per-file counts,
 #     date spans, and cross-file overlap. Old caches have no provenance tables;
 #     rebuild to populate them.
-CACHE_FORMAT_VERSION = 6
+# v7: two de-dup identity fixes for the same message arriving from different
+#     sources. (a) The body is compared with leading/trailing whitespace
+#     stripped (an iMessage attributedBody export keeps a trailing space the
+#     Android backup does not). (b) A plain <sms> and an <mms> text part now
+#     share the identity ('text'), so a message stored as an SMS in one archive
+#     and an MMS text part in another collapses. Old caches hold these
+#     near-duplicate rows; rebuild to drop them.
+CACHE_FORMAT_VERSION = 7
 
 # Your own phone number (digits only), used to identify "you" in group
 # conversations. Set MY_PHONE_NUMBER in a local .env file — never hardcode it.
@@ -504,6 +511,13 @@ def generate_unique_hash(msg, part_identifier=""):
     message uniquely — a real collision needs two DIFFERENT messages with
     identical text, box and participants inside the same one-second window,
     which does not happen in practice.
+
+    `body` is compared with leading/trailing whitespace STRIPPED. Different
+    sources decorate the same text differently at the edges (an iMessage
+    attributedBody export keeps a trailing space, e.g. 'recommendations ',
+    while the Android archive stores 'recommendations'), which defeated
+    de-duplication. Only edge whitespace is removed — interior differences are
+    preserved, so two genuinely different messages are never merged.
     """
     raw_date = msg.get('date', '') or ''
     try:
@@ -513,7 +527,7 @@ def generate_unique_hash(msg, part_identifier=""):
     data = "-".join(str(x) for x in (
         msg.get('participants', '') or '',
         date_key,
-        msg.get('body', '') or '',
+        (msg.get('body') or '').strip(),
         msg.get('type', '') or '',
         part_identifier,
     ))
@@ -884,7 +898,12 @@ def process_xml_files():
                             'mms_media_path': None, 'mms_media_type': None, 
                             'sender_address': normalized_address, 'participants': normalized_address
                         }
-                        msg_data['unique_hash'] = generate_unique_hash(msg_data, part_identifier='sms')
+                        # Same part_identifier ('text') as an MMS text part: the
+                        # SAME message often arrives as a plain <sms> in one archive
+                        # and as an <mms> text part in another (e.g. an iMessage
+                        # export vs an Android SMS backup). Sharing the identifier
+                        # lets those collapse instead of double-showing.
+                        msg_data['unique_hash'] = generate_unique_hash(msg_data, part_identifier='text')
                         messages_to_insert.append(msg_data)
                         file_hashes.add(msg_data['unique_hash'])
 
@@ -1202,7 +1221,23 @@ def set_directory():
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in set_directory: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected server error occurred.'}), 500
-    
+
+
+@app.route('/api/current-directory')
+def current_directory():
+    """Whether the server already has an active archive selected. Lets the SPA
+    skip the folder picker on reload (e.g. when returning from /analytics)
+    instead of forcing the user to re-pick their folder."""
+    path = app.config.get('XML_DIRECTORY')
+    if not path or not app.config.get('DB_PATH') or not os.path.exists(app.config['DB_PATH']):
+        return jsonify({'configured': False})
+    try:
+        assessment = assess_cache(path)
+    except Exception:
+        assessment = {'status': 'ready'}
+    return jsonify({'configured': True, 'path': path, 'cache': assessment})
+
+
 @app.route('/api/start-indexing', methods=['POST'])
 def start_indexing():
     if indexing_status['running']: return jsonify({'message': 'Indexing is already in progress.'}), 409
@@ -1330,6 +1365,8 @@ def get_stats():
             'total_mms_images': conn.execute('SELECT COUNT(*) FROM messages WHERE mms_media_path IS NOT NULL').fetchone()[0],
             'db_size_mb': round(os.path.getsize(app.config["DB_PATH"]) / (1024*1024), 2),
             'date_range': f"{_fmt_date(date_min)} to {_fmt_date(date_max)}" if date_min and date_max else '',
+            'date_min': date_min,   # raw epoch ms, for the date-range scrubber bounds
+            'date_max': date_max,
         }
         return jsonify(stats)
     except sqlite3.OperationalError:
@@ -1351,6 +1388,57 @@ def _months_between(ym_min, ym_max):
             m = 1
             y += 1
     return out
+
+
+def _date_bounds(args):
+    """Read optional 'start'/'end' epoch-ms query params for the date-range
+    filter. Returns (start_ms, end_ms), either of which may be None (open-ended
+    or absent). Non-integer values are ignored (treated as absent)."""
+    start = args.get('start', type=int)
+    end = args.get('end', type=int)
+    return start, end
+
+
+def _date_sql(start_ms, end_ms, col='date'):
+    """Build an SQL fragment + params for a date range on `col`. Returns
+    (conditions:list[str], params:list). Empty when no bounds are given, so
+    callers compose it into either a fresh WHERE or an existing one."""
+    conds, params = [], []
+    if start_ms is not None:
+        conds.append(f'{col} >= ?'); params.append(start_ms)
+    if end_ms is not None:
+        conds.append(f'{col} <= ?'); params.append(end_ms)
+    return conds, params
+
+
+@app.route('/api/volume')
+def get_volume():
+    """Monthly message-volume histogram for the date-range scrubber. Tiny
+    payload: full span bounds plus one count per calendar month (gap-filled
+    with zeros so missing months are explicit)."""
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({'error': 'Could not connect to database.'}), 500
+    try:
+        rows = conn.execute(
+            "SELECT strftime('%Y-%m', date/1000, 'unixepoch', 'localtime') ym, COUNT(*) c "
+            "FROM messages GROUP BY ym ORDER BY ym"
+        ).fetchall()
+        counts = {r['ym']: r['c'] for r in rows if r['ym']}
+        drow = conn.execute('SELECT MIN(date), MAX(date) FROM messages').fetchone()
+        min_ms, max_ms = (drow[0], drow[1]) if drow else (None, None)
+        buckets = []
+        if counts:
+            for ym in _months_between(rows[0]['ym'], rows[-1]['ym']):
+                y, mo = int(ym[:4]), int(ym[5:7])
+                # Local month-start as epoch ms (naive local datetime -> timestamp).
+                t = int(datetime(y, mo, 1).timestamp() * 1000)
+                buckets.append({'t': t, 'c': counts.get(ym, 0)})
+        return jsonify({'min_ms': min_ms, 'max_ms': max_ms, 'buckets': buckets})
+    except sqlite3.OperationalError as e:
+        return jsonify({'error': f'Database is not initialized correctly: {e}'}), 500
+    finally:
+        conn.close()
 
 
 @app.route('/api/analytics')
@@ -1559,17 +1647,23 @@ def get_conversations():
     
     try:
         eff_spam = effective_spam_set(app.config.get('XML_DIRECTORY'), conn)
-        query = '''
+        # Optional date-range filter (scrubber). Applied before GROUP BY so
+        # counts and last-message dates reflect only the selected span, and
+        # threads with no in-range messages drop out entirely.
+        dconds, dparams = _date_sql(*_date_bounds(request.args))
+        where_sql = ('WHERE ' + ' AND '.join(dconds)) if dconds else ''
+        query = f'''
             SELECT
                 participants as address,
                 MAX(date) as last_message_date,
                 COUNT(id) as message_count,
                 SUM(CASE WHEN mms_media_path IS NOT NULL THEN 1 ELSE 0 END) as image_count
             FROM messages
+            {where_sql}
             GROUP BY participants
             ORDER BY last_message_date DESC
         '''
-        rows = conn.execute(query).fetchall()
+        rows = conn.execute(query, dparams).fetchall()
 
         conversations = []
         for row in rows:
@@ -1608,23 +1702,26 @@ def get_messages(participants):
     if conn is None: return jsonify({'error': 'Database not available.'}), 500
     
     try:
-        query = '''
-            SELECT 
+        # Optional date-range filter (scrubber) narrows the open thread too.
+        dconds, dparams = _date_sql(*_date_bounds(request.args), col='m.date')
+        extra_sql = (' AND ' + ' AND '.join(dconds)) if dconds else ''
+        query = f'''
+            SELECT
                 m.id, m.address, m.date, m.type, m.body, m.mms_media_path, m.mms_media_type, m.readable_date,
                 -- When the message is received (type=1), the sender is the person from sender_address.
                 -- When the message is sent (type=2), the sender is 'You'.
-                CASE 
-                    WHEN m.type = 2 THEN 'You' 
-                    ELSE COALESCE(s.name, m.sender_address) 
+                CASE
+                    WHEN m.type = 2 THEN 'You'
+                    ELSE COALESCE(s.name, m.sender_address)
                 END as sender,
                 -- contact_name should also reflect the sender's name for received messages.
                 COALESCE(s.name, m.sender_address) as contact_name
             FROM messages m
             LEFT JOIN contact_names s ON m.sender_address = s.address
-            WHERE m.participants = ? 
+            WHERE m.participants = ?{extra_sql}
             ORDER BY m.date ASC
         '''
-        rows = conn.execute(query, (participants,)).fetchall()
+        rows = conn.execute(query, (participants, *dparams)).fetchall()
         messages = [dict(row) for row in rows]
         return jsonify(messages)
     finally:
@@ -1660,6 +1757,10 @@ def search_messages():
             parts = (participants_str or '').split('~')
             return bool(eff_spam) and bool(parts) and all(p in eff_spam for p in parts)
 
+        # Optional date-range filter (scrubber). The match clauses below contain
+        # ORs, so the date bounds must be AND-ed onto a PARENTHESIZED group.
+        start_ms, end_ms = _date_bounds(request.args)
+
         # Conversations: by contact name, by the literal text, and (if the
         # query has digits) by number.
         conv_where = 'contact_name LIKE ? OR participants LIKE ?'
@@ -1667,6 +1768,9 @@ def search_messages():
         if has_digits:
             conv_where += ' OR participants LIKE ?'
             conv_params.append(dlike)
+        cdconds, cdparams = _date_sql(start_ms, end_ms)
+        conv_date_sql = (' AND ' + ' AND '.join(cdconds)) if cdconds else ''
+        conv_params += cdparams
         conv_query = f'''
             SELECT
                 participants as address,
@@ -1676,7 +1780,7 @@ def search_messages():
                 COALESCE(cn.name, participants) as contact_name
             FROM messages
             LEFT JOIN contact_names cn ON messages.participants = cn.address
-            WHERE {conv_where}
+            WHERE ({conv_where}){conv_date_sql}
             GROUP BY participants
             ORDER BY last_message_date DESC
         '''
@@ -1689,6 +1793,9 @@ def search_messages():
         if has_digits:
             msg_where += ' OR m.participants LIKE ? OR m.address LIKE ?'
             msg_params += [dlike, dlike]
+        mdconds, mdparams = _date_sql(start_ms, end_ms, col='m.date')
+        msg_date_sql = (' AND ' + ' AND '.join(mdconds)) if mdconds else ''
+        msg_params += mdparams
         msg_query = f'''
             SELECT
                 m.id, m.address, m.date, m.type, m.body, m.mms_media_path, m.mms_media_type, m.readable_date,
@@ -1698,7 +1805,7 @@ def search_messages():
             FROM messages m
             LEFT JOIN contact_names c ON m.participants = c.address
             LEFT JOIN contact_names s ON m.sender_address = s.address
-            WHERE {msg_where}
+            WHERE ({msg_where}){msg_date_sql}
             ORDER BY m.date DESC
             LIMIT 100
         '''
